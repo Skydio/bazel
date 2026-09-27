@@ -99,6 +99,14 @@ public interface ConfiguredTarget extends TransitiveInfoCollection, Structure, C
   }
 
   /**
+   * If the configured target is an alias, return the actual target directly pointed to by the
+   * alias, otherwise return the current target. This does not follow alias chains.
+   */
+  default ConfiguredTarget getActualNoFollow() {
+    return this;
+  }
+
+  /**
    * If the configured target is an alias, return the original label, otherwise return the current
    * label. This is not the same as {@code getActual().getLabel()}, because it does not follow alias
    * chains.
