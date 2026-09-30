@@ -20,12 +20,18 @@ import com.google.common.collect.ImmutableSet;
 import com.google.devtools.build.lib.bazel.repository.RepositoryOptions.LockfileMode;
 import com.google.devtools.build.lib.rules.repository.RepositoryDelegatorFunction;
 import com.google.devtools.build.lib.server.FailureDetails;
+import com.google.devtools.build.lib.skyframe.DirectoryTreeDigestValue;
 import com.google.devtools.build.lib.skyframe.PrecomputedValue.Precomputed;
 import com.google.devtools.build.lib.vfs.Path;
+import com.google.devtools.build.lib.vfs.PathFragment;
+import com.google.devtools.build.lib.vfs.Root;
+import com.google.devtools.build.lib.vfs.RootedPath;
 import com.google.devtools.build.skyframe.SkyFunction;
 import com.google.devtools.build.skyframe.SkyFunctionException;
 import com.google.devtools.build.skyframe.SkyKey;
 import com.google.devtools.build.skyframe.SkyValue;
+import java.io.IOException;
+import java.net.URI;
 import java.net.URISyntaxException;
 import java.time.Duration;
 import java.time.Instant;
@@ -75,9 +81,15 @@ public class RegistryFunction implements SkyFunction {
     }
 
     RegistryKey key = (RegistryKey) skyKey.argument();
+    String url = key.url().replace("%workspace%", workspaceRoot.getPathString());
     try {
+      // Local registries are mutable and their files are read outside of Skyframe, so depend on a
+      // digest of the whole registry tree to invalidate the in-memory registry contents on change.
+      if (!dependOnLocalRegistryTree(url, env)) {
+        return null;
+      }
       return registryFactory.createRegistry(
-          key.url().replace("%workspace%", workspaceRoot.getPathString()),
+          url,
           lockfileMode,
           lockfile.getRegistryFileHashes(),
           lockfile.getSelectedYankedVersions(),
@@ -90,6 +102,29 @@ public class RegistryFunction implements SkyFunction {
               e,
               "Invalid registry URL: %s",
               key.url()));
+    }
+  }
+
+  /** Returns false if a Skyframe dependency is missing. */
+  private boolean dependOnLocalRegistryTree(String url, Environment env)
+      throws URISyntaxException, InterruptedException, RegistryException {
+    URI uri = new URI(url);
+    if (!"file".equals(uri.getScheme())) {
+      return true;
+    }
+    RootedPath registryRoot =
+        RootedPath.toRootedPath(
+            Root.absoluteRoot(workspaceRoot.getFileSystem()), PathFragment.create(uri.getPath()));
+    try {
+      return env.getValueOrThrow(DirectoryTreeDigestValue.key(registryRoot), IOException.class)
+          != null;
+    } catch (IOException e) {
+      throw new RegistryException(
+          ExternalDepsException.withCauseAndMessage(
+              FailureDetails.ExternalDeps.Code.ERROR_ACCESSING_REGISTRY,
+              e,
+              "Failed to read local registry %s",
+              url));
     }
   }
 
