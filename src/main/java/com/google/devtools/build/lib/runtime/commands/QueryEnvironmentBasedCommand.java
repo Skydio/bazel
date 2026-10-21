@@ -144,7 +144,7 @@ public abstract class QueryEnvironmentBasedCommand implements BlazeCommand {
           Query.Code.OUTPUT_FORMAT_INVALID);
     }
 
-    if (queryOptions.getGenerateHashes()) {
+    if (queryOptions.generateHashes) {
       ImmutableList<String> filters = getDependencyFilters(queryOptions);
       if (!filters.isEmpty()) {
         return reportAndCreateFailureResult(
@@ -306,14 +306,14 @@ public abstract class QueryEnvironmentBasedCommand implements BlazeCommand {
 
   private static ImmutableList<String> getDependencyFilters(QueryOptions queryOptions) {
     ImmutableList.Builder<String> filters = ImmutableList.builder();
-    if (!queryOptions.getIncludeImplicitDeps()) {
+    if (!queryOptions.includeImplicitDeps) {
       filters.add("--noimplicit_deps");
     }
-    if (!queryOptions.getIncludeToolDeps()) {
+    if (!queryOptions.includeToolDeps) {
       filters.add("--notool_deps");
     }
-    if (queryOptions.getAspectDeps() != AspectResolver.Mode.CONSERVATIVE) {
-      filters.add("--aspect_deps=" + queryOptions.getAspectDeps());
+    if (queryOptions.aspectDeps != AspectResolver.Mode.CONSERVATIVE) {
+      filters.add("--aspect_deps=" + queryOptions.aspectDeps);
     }
     return filters.build();
   }

@@ -75,7 +75,6 @@ import java.util.TreeSet;
 import javax.annotation.Nullable;
 import net.starlark.java.eval.Dict;
 import net.starlark.java.eval.Starlark;
-import net.starlark.java.eval.StarlarkSemantics;
 
 /**
  * Computes the direct hash of an unconfigured target for {@code query --generate_hashes}: a hash of
@@ -299,7 +298,7 @@ public final class DirectTargetHashFunction implements SkyFunction {
           deps.removeIf(
               dep ->
                   dep.getPackageIdentifier().equals(label.getPackageIdentifier())
-                      && pkg.getTargetOrNull(dep.getName()) instanceof InputFile);
+                      && pkg.getTargets().get(dep.getName()) instanceof InputFile);
     }
 
     SourceFileDigestFunction.Value fileDigest = null;
@@ -558,7 +557,7 @@ public final class DirectTargetHashFunction implements SkyFunction {
       fp.addInt(attributes.size());
       for (String attribute : new TreeSet<>(attributes.keySet())) {
         fp.addString(attribute);
-        fp.addString(Starlark.repr(attributes.get(attribute), StarlarkSemantics.DEFAULT));
+        fp.addString(Starlark.repr(attributes.get(attribute)));
       }
     }
     fp.addInt(files.size());

@@ -19,7 +19,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.devtools.build.lib.analysis.BlazeDirectories;
 import com.google.devtools.build.lib.analysis.util.AnalysisMock;
-import com.google.devtools.build.lib.events.EventBusEventHandler;
+import com.google.common.eventbus.EventBus;
 import com.google.devtools.build.lib.events.Reporter;
 import com.google.devtools.build.lib.packages.LabelPrinter;
 import com.google.devtools.build.lib.query2.PostAnalysisQueryEnvironment;
@@ -175,7 +175,7 @@ public class HashesOutputFormatterCallbackTest extends ConfiguredTargetQueryTest
     ByteArrayOutputStream output = new ByteArrayOutputStream();
     HashesOutputFormatterCallback callback =
         new HashesOutputFormatterCallback(
-            new Reporter(EventBusEventHandler.createWithNewEventBus()),
+            new Reporter(new EventBus()),
             Options.getDefaults(CqueryOptions.class),
             new PrintStream(output),
             getHelper().getSkyframeExecutor(),

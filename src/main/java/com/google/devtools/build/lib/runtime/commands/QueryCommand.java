@@ -109,7 +109,7 @@ public final class QueryCommand extends QueryEnvironmentBasedCommand {
     }
 
     try {
-      if (!queryOptions.getGenerateHashes()) {
+      if (!queryOptions.generateHashes) {
         formatter.verifyCompatible(queryEnv, expr);
       }
     } catch (QueryException e) {
@@ -140,7 +140,7 @@ public final class QueryCommand extends QueryEnvironmentBasedCommand {
     ThreadSafeOutputFormatterCallback<Target> callback;
     HashFunction hashFunction =
         env.getRuntime().getFileSystem().getDigestFunction().getHashFunction();
-    boolean generateHashes = queryOptions.getGenerateHashes();
+    boolean generateHashes = queryOptions.generateHashes;
     if (generateHashes) {
       // Hashes are computed after evaluation, so aggregate the results instead of streaming them.
       callback = QueryUtil.newLexicographicallySortedTargetAggregator();
@@ -253,7 +253,7 @@ public final class QueryCommand extends QueryEnvironmentBasedCommand {
     EvaluationContext evaluationContext =
         EvaluationContext.newBuilder()
             .setParallelism(
-                env.getOptions().getOptions(LoadingPhaseThreadsOption.class).getThreads())
+                env.getOptions().getOptions(LoadingPhaseThreadsOption.class).threads)
             .setEventHandler(env.getReporter())
             .build();
     TransitiveHashes.Result result =

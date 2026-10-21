@@ -178,7 +178,7 @@ public class ConfiguredTargetQueryEnvironment extends PostAnalysisQueryEnvironme
           PackageManager packageManager,
           StarlarkSemantics starlarkSemantics)
           throws QueryException, InterruptedException {
-    if (cqueryOptions.getGenerateHashes()) {
+    if (cqueryOptions.generateHashes) {
       return ImmutableList.of(
           new HashesOutputFormatterCallback(
               eventHandler,

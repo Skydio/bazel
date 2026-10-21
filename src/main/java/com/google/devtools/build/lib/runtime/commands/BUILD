@@ -27,6 +27,7 @@ java_library(
     ],
     deps = [
         ":paths_to_replace_utils",
+        "//src/main/java/com/google/devtools/build/lib/analysis:blaze_directories",
         "//src/main/java/com/google/devtools/build/lib:build-request-options",
         "//src/main/java/com/google/devtools/build/lib:keep-going-option",
         "//src/main/java/com/google/devtools/build/lib:loading-phase-threads-option",

@@ -18,9 +18,9 @@ java_test(
     deps = [
         "//src/main/java/com/google/devtools/build/lib/cmdline",
         "//src/main/java/com/google/devtools/build/lib/query2/query/hash",
-        "//third_party/java/guava:collect",
-        "//third_party/java/junit",
-        "//third_party/java/truth",
+        "//third_party:guava",
+        "//third_party:junit4",
+        "//third_party:truth",
     ],
 )
 
@@ -36,8 +36,8 @@ java_test(
         "//src/main/java/com/google/devtools/build/skyframe",
         "//src/main/java/com/google/devtools/build/skyframe:skyframe-objects",
         "//src/test/java/com/google/devtools/build/lib/analysis/util",
-        "//third_party/java/guava:collect",
-        "//third_party/java/junit",
-        "//third_party/java/truth",
+        "//third_party:guava",
+        "//third_party:junit4",
+        "//third_party:truth",
     ],
 )

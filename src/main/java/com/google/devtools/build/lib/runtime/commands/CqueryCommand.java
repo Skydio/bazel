@@ -148,8 +148,8 @@ public final class CqueryCommand implements BlazeCommand {
     }
 
     CqueryOptions cqueryOptions = options.getOptions(CqueryOptions.class);
-    if (cqueryOptions.getGenerateHashes()
-        && (!cqueryOptions.getIncludeImplicitDeps() || !cqueryOptions.getIncludeToolDeps())) {
+    if (cqueryOptions.generateHashes
+        && (!cqueryOptions.includeImplicitDeps || !cqueryOptions.includeToolDeps)) {
       String message =
           "--experimental_generate_hashes hashes all dependencies and can't be combined with"
               + " --noimplicit_deps or --notool_deps";

@@ -2,7 +2,7 @@ load("@rules_java//java:defs.bzl", "java_library")
 
 package(
     default_applicable_licenses = ["//:license"],
-    default_visibility = ["//src/main/java/com/google/devtools/build/lib:build_lib"],
+    default_visibility = ["//src:__subpackages__"],
 )
 
 filegroup(
@@ -15,7 +15,7 @@ java_library(
     name = "hash",
     srcs = glob(["*.java"]),
     visibility = [
-        "//src/main/java/com/google/devtools/build/lib:build_lib",
+        "//src:__subpackages__",
         "//src/test/java/com/google/devtools/build/lib/query2/cquery:__pkg__",
         "//src/test/java/com/google/devtools/build/lib/query2/query/hash:__pkg__",
     ],
@@ -49,10 +49,7 @@ java_library(
         "//src/main/java/com/google/devtools/build/skyframe:skyframe-objects",
         "//src/main/java/net/starlark/java/eval",
         "//src/main/protobuf:build_java_proto",
-        "//third_party/java/guava:base",
-        "//third_party/java/guava:collect",
-        "//third_party/java/guava:hash",
-        "//third_party/java/guava:io",
-        "//third_party/java/jsr305_annotations",
+        "//third_party:guava",
+        "//third_party:jsr305",
     ],
 )
