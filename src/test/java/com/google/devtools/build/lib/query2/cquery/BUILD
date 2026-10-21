@@ -60,6 +60,32 @@ java_test(
 )
 
 java_test(
+    name = "HashesOutputFormatterCallbackTest",
+    size = "medium",
+    srcs = ["HashesOutputFormatterCallbackTest.java"],
+    shard_count = 2,
+    deps = [
+        ":configured_target_query_helper",
+        ":configured_target_query_test",
+        "//src/main/java/com/google/devtools/build/lib/analysis:blaze_directories",
+        "//src/main/java/com/google/devtools/build/lib/events",
+        "//src/main/java/com/google/devtools/build/lib/packages:label_printer",
+        "//src/main/java/com/google/devtools/build/lib/query2",
+        "//src/main/java/com/google/devtools/build/lib/query2/common:cquery-node",
+        "//src/main/java/com/google/devtools/build/lib/query2/engine",
+        "//src/main/java/com/google/devtools/build/lib/query2/query/hash",
+        "//src/main/java/com/google/devtools/build/skyframe",
+        "//src/main/java/com/google/devtools/build/skyframe:skyframe-objects",
+        "//src/main/java/com/google/devtools/common/options:options_internal",
+        "//src/test/java/com/google/devtools/build/lib/analysis/util",
+        "//src/test/java/com/google/devtools/build/lib/query2/testutil",
+        "//third_party:guava",
+        "//third_party:junit4",
+        "//third_party:truth",
+    ],
+)
+
+java_test(
     name = "ConfiguredTargetQuerySemanticsTest",
     size = "medium",
     timeout = "long",
