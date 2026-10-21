@@ -52,6 +52,7 @@ import com.google.devtools.build.lib.vfs.FileStatus;
 import com.google.devtools.build.lib.vfs.FileSymlinkLoopException;
 import com.google.devtools.build.lib.vfs.FileSystem;
 import com.google.devtools.build.lib.vfs.FileSystemUtils;
+import com.google.devtools.build.lib.vfs.InMemoryRepoMarkerFiles;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.SymlinkTargetType;
@@ -88,7 +89,7 @@ import javax.annotation.Nullable;
  * memory in the {@link RemoteExternalFileSystem}.
  */
 public final class RemoteExternalOverlayFileSystem extends FileSystem
-    implements SubtreeMaterializer {
+    implements SubtreeMaterializer, InMemoryRepoMarkerFiles {
   private final PathFragment externalDirectory;
   private final int externalDirectorySegmentCount;
   private final FileSystem nativeFs;
@@ -468,6 +469,13 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem
    * <p>This is used to make the files below a source directory action input available to local
    * actions, which access them through the native file system.
    */
+  @Nullable
+  @Override
+  public String getInMemoryMarkerFileContents(String repoName) {
+    // Once a repo is materialized, its marker file is on disk again.
+    return materializedRepos.contains(repoName) ? null : markerFileContents.get(repoName);
+  }
+
   @Override
   public void ensureSubtreeMaterialized(PathFragment path)
       throws IOException, InterruptedException {
