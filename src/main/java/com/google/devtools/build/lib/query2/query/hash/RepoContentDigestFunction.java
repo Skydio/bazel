@@ -14,15 +14,19 @@
 package com.google.devtools.build.lib.query2.query.hash;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.io.BaseEncoding;
 import com.google.devtools.build.lib.analysis.BlazeDirectories;
 import com.google.devtools.build.lib.bazel.repository.RepoDefinition;
 import com.google.devtools.build.lib.bazel.repository.RepoDefinitionValue;
+import com.google.devtools.build.lib.bazel.repository.cache.LocalRepoContentsCache;
 import com.google.devtools.build.lib.cmdline.LabelConstants;
 import com.google.devtools.build.lib.cmdline.RepositoryName;
 import com.google.devtools.build.lib.rules.repository.RepositoryDirectoryValue;
 import com.google.devtools.build.lib.util.Fingerprint;
 import com.google.devtools.build.lib.vfs.Dirent;
 import com.google.devtools.build.lib.vfs.FileStatus;
+import com.google.devtools.build.lib.vfs.FileSystemUtils;
+import com.google.devtools.build.lib.vfs.InMemoryRepoMarkerFiles;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.Symlinks;
@@ -61,14 +65,24 @@ import javax.annotation.Nullable;
  * Bazel refetches the repo when such a file changes (if the repo rule watches it), but the symlink
  * itself stays the same.
  *
+ * <p>Reading every file of every fetched repo dominates the cost of a cold server, so the digest is
+ * persisted next to the repo's marker file, as {@code @<repo>.content_digest}, keyed by an identity
+ * of the fetch that includes the marker. A new server reads it back instead of the repo's files, as
+ * long as the repo has not been refetched since.
+ *
  * <p>For other repos (the main repo, {@code local} and {@code configure} repos, and overridden
  * repos), {@link Value#usesFileDigests} is true and source files are hashed individually by {@link
- * SourceFileDigestFunction}.
+ * SourceFileDigestFunction}. Their digests are never persisted.
  */
 public final class RepoContentDigestFunction implements SkyFunction {
   // Not hermetic: the repo's files are read directly instead of through Skyframe.
   public static final SkyFunctionName NAME =
       SkyFunctionName.createNonHermetic("QUERY_REPO_CONTENT_DIGEST");
+
+  private static final String DIGEST_FILE_SUFFIX = ".content_digest";
+
+  // Changing what a digest or a fetch identity covers requires a new format.
+  private static final String DIGEST_FILE_FORMAT = "1";
 
   private final BlazeDirectories directories;
 
@@ -159,11 +173,19 @@ public final class RepoContentDigestFunction implements SkyFunction {
     if (!(directory instanceof RepositoryDirectoryValue.Success success)) {
       return Value.USE_FILE_DIGESTS;
     }
+    Path root = success.root().asPath();
+    Path externalRoot =
+        directories.getOutputBase().getRelative(LabelConstants.EXTERNAL_REPOSITORY_LOCATION);
+    Path digestFile = externalRoot.getChild("@" + repo.getName() + DIGEST_FILE_SUFFIX);
+    @Nullable String fetchIdentity = fetchIdentity(repo, root, externalRoot);
+    if (fetchIdentity != null) {
+      byte[] persisted = readPersistedDigest(digestFile, fetchIdentity);
+      if (persisted != null) {
+        return new Value(persisted);
+      }
+    }
     Fingerprint fp = new Fingerprint();
     try {
-      Path root = success.root().asPath();
-      Path externalRoot =
-          directories.getOutputBase().getRelative(LabelConstants.EXTERNAL_REPOSITORY_LOCATION);
       // Most specific first. The repo root may itself be a symlink into the repo contents cache.
       ImmutableList<SymlinkBase> bases =
           ImmutableList.of(
@@ -176,7 +198,100 @@ public final class RepoContentDigestFunction implements SkyFunction {
     } catch (IOException e) {
       throw new RepoContentDigestFunctionException(e);
     }
-    return new Value(fp.digestAndReset());
+    byte[] digest = fp.digestAndReset();
+    if (fetchIdentity != null) {
+      persistDigest(digestFile, fetchIdentity, digest);
+    }
+    return new Value(digest);
+  }
+
+  /**
+   * Returns a string that differs between any two fetches of {@code repo} that can produce different
+   * files, or null if there is none and the repo's digest must not be persisted.
+   *
+   * <p>Every case includes the repo's marker file, which records the inputs of its repo rule
+   * (definition, and the contents of the files and directories it read, such as the patches and
+   * overlay files of a local registry module).
+   */
+  @Nullable
+  private static String fetchIdentity(RepositoryName repo, Path root, Path externalRoot) {
+    try {
+      if (root.getFileSystem() instanceof InMemoryRepoMarkerFiles inMemory) {
+        String marker = inMemory.getInMemoryMarkerFileContents(repo.getName());
+        if (marker != null) {
+          // Served from the remote repo contents cache, whose entries are addressed by the marker.
+          return identity("remote_repo_contents_cache", marker);
+        }
+      }
+      FileStatus status = root.statIfFound(Symlinks.NOFOLLOW);
+      if (status == null) {
+        return null;
+      }
+      if (status.isSymbolicLink()) {
+        // Served from the repo contents cache. An entry is never modified, and Bazel moves the
+        // repo's marker file next to it.
+        Path entry = root.resolveSymbolicLinks();
+        Path recordedInputs =
+            entry
+                .getParentDirectory()
+                .getChild(entry.getBaseName() + LocalRepoContentsCache.RECORDED_INPUTS_SUFFIX);
+        if (!recordedInputs.isFile()) {
+          return null;
+        }
+        return identity("repo_contents_cache", entry.getPathString(), readLatin1(recordedInputs));
+      }
+      Path marker = externalRoot.getChild(repo.getMarkerFileName());
+      if (!marker.isFile()) {
+        return null;
+      }
+      // Bazel recreates the repo directory on every refetch, even when the marker comes out the
+      // same, for example when a repo rule downloads a file it does not pin.
+      return identity(
+          "fetched",
+          readLatin1(marker),
+          Long.toString(status.getNodeId()),
+          Long.toString(status.getLastChangeTime()));
+    } catch (IOException e) {
+      return null;
+    }
+  }
+
+  private static String identity(String... parts) {
+    Fingerprint fp = new Fingerprint();
+    fp.addString(DIGEST_FILE_FORMAT);
+    for (String part : parts) {
+      fp.addString(part);
+    }
+    return fp.hexDigestAndReset();
+  }
+
+  private static String readLatin1(Path path) throws IOException {
+    return new String(FileSystemUtils.readContentAsLatin1(path));
+  }
+
+  /** Returns the digest persisted for {@code fetchIdentity}, or null if there is none. */
+  @Nullable
+  private static byte[] readPersistedDigest(Path digestFile, String fetchIdentity) {
+    try {
+      String[] fields = readLatin1(digestFile).strip().split(" ");
+      if (fields.length != 2 || !fields[0].equals(fetchIdentity) || fields[1].isEmpty()) {
+        return null;
+      }
+      return BaseEncoding.base16().lowerCase().decode(fields[1]);
+    } catch (IOException | IllegalArgumentException e) {
+      return null;
+    }
+  }
+
+  private static void persistDigest(Path digestFile, String fetchIdentity, byte[] digest) {
+    Path tmp = digestFile.getParentDirectory().getChild(digestFile.getBaseName() + ".tmp");
+    try {
+      FileSystemUtils.writeContentAsLatin1(
+          tmp, fetchIdentity + " " + BaseEncoding.base16().lowerCase().encode(digest) + "\n");
+      tmp.renameTo(digestFile);
+    } catch (IOException e) {
+      // Persisting is only an optimization: without it, the next server computes the digest again.
+    }
   }
 
   /** A directory that absolute symlink targets under it are hashed relative to. */

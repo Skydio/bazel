@@ -14,6 +14,7 @@
 package com.google.devtools.build.lib.query2.query.hash;
 
 import static com.google.common.truth.Truth.assertThat;
+import static java.nio.charset.StandardCharsets.ISO_8859_1;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -24,6 +25,8 @@ import com.google.devtools.build.lib.analysis.util.AnalysisMock;
 import com.google.devtools.build.lib.analysis.util.BuildViewTestCase;
 import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.rules.repository.RepositoryDirectoryValue;
+import com.google.devtools.build.lib.vfs.FileSystemUtils;
+import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.skyframe.EvaluationContext;
 import com.google.devtools.build.skyframe.SkyFunction;
 import com.google.devtools.build.skyframe.SkyFunctionName;
@@ -177,16 +180,17 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
             rctx.watch(rctx.attr.linked)
             rctx.symlink(rctx.attr.linked, "linked.txt")
 
-        content_repo = repository_rule(
-            implementation = _impl,
-            attrs = {
-                "content": attr.string(),
-                "unused": attr.string(),
-                "patch": attr.label(),
-                "template": attr.label(default = "//tc:template.txt"),
-                "linked": attr.label(default = "//tc:linked.txt"),
-            },
-        )
+        _ATTRS = {
+            "content": attr.string(),
+            "unused": attr.string(),
+            "patch": attr.label(),
+            "template": attr.label(default = "//tc:template.txt"),
+            "linked": attr.label(default = "//tc:linked.txt"),
+        }
+
+        content_repo = repository_rule(implementation = _impl, attrs = _ATTRS)
+
+        local_content_repo = repository_rule(implementation = _impl, local = True, attrs = _ATTRS)
         """);
     scratch.file(
         "ext_user/BUILD",
@@ -422,5 +426,99 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
 
     assertThat(changed(before, executable)).containsExactly("//app:unrelated");
     assertThat(hashes()).isEqualTo(before);
+  }
+  /** Drops every computed hash, as a new server would start without them. */
+  private void dropHashValues() {
+    getSkyframeExecutor()
+        .getEvaluator()
+        .delete(
+            key ->
+                key.functionName().equals(RepoContentDigestFunction.NAME)
+                    || key.functionName().equals(SourceFileDigestFunction.NAME)
+                    || key.functionName().equals(DirectTargetHashFunction.NAME));
+  }
+
+  private ImmutableList<Path> persistedDigestFiles() throws Exception {
+    Path external = directories.getOutputBase().getRelative("external");
+    return external.getDirectoryEntries().stream()
+        .filter(path -> path.getBaseName().endsWith(".content_digest"))
+        .collect(ImmutableList.toImmutableList());
+  }
+
+  private Path onlyPersistedDigestFile() throws Exception {
+    return Iterables.getOnlyElement(persistedDigestFiles());
+  }
+
+  @Test
+  public void externalRepoDigest_isReadBackAfterHashValuesAreDropped() throws Exception {
+    ImmutableMap<Label, String> before = extHashes();
+    Path digestFile = onlyPersistedDigestFile();
+    String identity = FileSystemUtils.readContent(digestFile, ISO_8859_1).split(" ")[0];
+
+    // A new server must use the persisted digest instead of reading the repo's files again.
+    FileSystemUtils.writeContent(digestFile, ISO_8859_1, identity + " " + "00".repeat(32) + "\n");
+    dropHashValues();
+    assertThat(extHashes()).isNotEqualTo(before);
+
+    digestFile.delete();
+    dropHashValues();
+    assertThat(extHashes()).isEqualTo(before);
+  }
+
+  @Test
+  public void externalRepoChangedAfterHashValuesAreDropped_affectsDependents() throws Exception {
+    ImmutableMap<Label, String> before = extHashes();
+    dropHashValues();
+
+    writeModuleFile(/* content= */ "changed", /* unused= */ "1");
+
+    assertThat(extHashes()).isNotEqualTo(before);
+  }
+
+  @Test
+  public void externalRepoRefetchedWithSameContentsAfterHashValuesAreDropped_doesNotAffectDependents()
+      throws Exception {
+    ImmutableMap<Label, String> before = extHashes();
+    dropHashValues();
+
+    writeModuleFile(/* content= */ "a", /* unused= */ "2");
+
+    assertThat(extHashes()).isEqualTo(before);
+  }
+
+  @Test
+  public void corruptPersistedDigest_isComputedAgain() throws Exception {
+    ImmutableMap<Label, String> before = extHashes();
+
+    FileSystemUtils.writeContent(onlyPersistedDigestFile(), ISO_8859_1, "not a digest");
+    dropHashValues();
+
+    assertThat(extHashes()).isEqualTo(before);
+  }
+
+  @Test
+  public void localRepo_isHashedPerFileAndNeverPersisted() throws Exception {
+    rewriteModuleDotBazel(
+        "register_toolchains('//tc:all')",
+        "local_content_repo = use_repo_rule('//defs:repos.bzl', 'local_content_repo')",
+        "local_content_repo(name = 'local_ext', content = 'a')");
+    scratch.file(
+        "local_user/BUILD",
+        """
+        filegroup(
+            name = "uses_local",
+            srcs = ["@local_ext//:files"],
+        )
+        """);
+    Label user = Label.parseCanonical("//local_user:uses_local");
+
+    ImmutableMap<Label, String> before = hashes(user);
+
+    assertThat(persistedDigestFiles()).isEmpty();
+    rewriteModuleDotBazel(
+        "register_toolchains('//tc:all')",
+        "local_content_repo = use_repo_rule('//defs:repos.bzl', 'local_content_repo')",
+        "local_content_repo(name = 'local_ext', content = 'changed')");
+    assertThat(hashes(user)).isNotEqualTo(before);
   }
 }
