@@ -307,6 +307,44 @@ public class ParallelEvaluatorTest {
   }
 
   @Test
+  public void workerAwait_releasesHostThreadUntilFutureIsDone() throws Exception {
+    SkyKey key = skyKey("key");
+    SettableFuture<String> future = SettableFuture.create();
+    AtomicInteger computeCalls = new AtomicInteger();
+    tester
+        .getOrCreate(key)
+        .setBuilder(
+            (skyKey, env) -> {
+              computeCalls.incrementAndGet();
+              var state = env.getState(WorkerSkyKeyComputeState<SkyValue>::new);
+              try {
+                return state.startOrContinueWork(
+                    env,
+                    "worker",
+                    workerEnv -> new StringValue(WorkerSkyKeyComputeState.await(workerEnv, future)));
+              } catch (ExecutionException e) {
+                throw new IllegalStateException(e);
+              }
+            });
+    // The future only completes once the host has returned with it as an external dep. A host
+    // blocked on the worker would never get there.
+    graph =
+        NotifyingHelper.makeNotifyingTransformer(
+                (k, type, order, context) -> {
+                  if (k == key && type == EventType.ADD_EXTERNAL_DEP) {
+                    future.set("done");
+                  }
+                })
+            .transform(new InMemoryGraphImpl());
+
+    EvaluationResult<StringValue> result = eval(/* keepGoing= */ false, ImmutableList.of(key));
+
+    assertThat(result.hasError()).isFalse();
+    assertThat(result.get(key)).isEqualTo(new StringValue("done"));
+    assertThat(computeCalls.get()).isEqualTo(2);
+  }
+
+  @Test
   public void dependsOnKeyAndFuture() throws Exception {
     SkyKey parentKey = skyKey("parentKey");
     SkyKey childKey = skyKey("childKey");

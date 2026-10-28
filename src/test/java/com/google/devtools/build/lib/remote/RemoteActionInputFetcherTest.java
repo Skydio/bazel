@@ -211,7 +211,7 @@ public class RemoteActionInputFetcherTest extends ActionInputPrefetcherTestBase 
           IOException.class,
           () ->
               overlayFs.injectRemoteRepo(
-                  RepositoryName.createUnvalidated("repo"), tree, "MARKER\n"));
+                  RepositoryName.createUnvalidated("repo"), tree, "MARKER\n", future -> {}));
     }
   }
 

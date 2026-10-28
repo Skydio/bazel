@@ -28,6 +28,7 @@ import build.bazel.remote.execution.v2.Tree;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.collect.Iterables;
 import com.google.common.util.concurrent.ListeningExecutorService;
 import com.google.common.util.concurrent.MoreExecutors;
@@ -208,7 +209,8 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem
    * Injects the given remote contents, possibly prefetching some files, and returns true on
    * success.
    */
-  public boolean injectRemoteRepo(RepositoryName repo, Tree remoteContents, String markerFile)
+  public boolean injectRemoteRepo(
+      RepositoryName repo, Tree remoteContents, String markerFile, Awaiter awaiter)
       throws IOException, InterruptedException {
     var repoDir = externalDirectory.getChild(repo.getName());
     deleteTree(repoDir);
@@ -234,7 +236,7 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem
     try {
       // TODO: This prefetches a large number of small files. Investigate whether BatchReadBlobs
       // would be more efficient.
-      prefetch(filesToPrefetch);
+      prefetch(filesToPrefetch, awaiter);
     } catch (BulkTransferException e) {
       if (e.allCausedByCacheNotFoundException()) {
         // The cache has lost the prefetched files, which should be treated just like a cache miss.
@@ -434,20 +436,32 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem
     markerFileSibling.renameTo(markerFile);
   }
 
+  /** Waits for a future to be done, successfully or not. */
+  @FunctionalInterface
+  public interface Awaiter {
+    void awaitDone(ListenableFuture<?> future) throws InterruptedException;
+  }
+
   private void prefetch(Iterable<PathFragment> paths) throws IOException, InterruptedException {
+    prefetch(paths, future -> {});
+  }
+
+  private void prefetch(Iterable<PathFragment> paths, Awaiter awaiter)
+      throws IOException, InterruptedException {
     // These paths may have been prefetched and then deleted again earlier in this invocation, e.g.
     // by an injection whose fetch was subsequently restarted due to memory pressure. The
     // prefetcher's download cache would otherwise consider them downloaded already and not even
     // verify they exist on the local file system.
     inputPrefetcher.invalidateDownloads(paths);
-    var unused =
-        getFromFuture(
-            inputPrefetcher.prefetchFilesInterruptibly(
-                /* action= */ null,
-                Iterables.transform(paths, ActionInputHelper::fromPath),
-                actionInput -> externalFs.getMetadata(actionInput.getExecPath()),
-                ActionInputPrefetcher.Priority.CRITICAL,
-                ActionInputPrefetcher.Reason.INPUTS));
+    var future =
+        inputPrefetcher.prefetchFilesInterruptibly(
+            /* action= */ null,
+            Iterables.transform(paths, ActionInputHelper::fromPath),
+            actionInput -> externalFs.getMetadata(actionInput.getExecPath()),
+            ActionInputPrefetcher.Priority.CRITICAL,
+            ActionInputPrefetcher.Reason.INPUTS);
+    awaiter.awaitDone(future);
+    var unused = getFromFuture(future);
   }
 
   /**

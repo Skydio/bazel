@@ -61,7 +61,7 @@ public final class RemoteExternalOverlayFileSystemTest {
         Duration.ofMinutes(1));
     try {
       var repo = RepositoryName.create("repo");
-      assertThat(overlay.injectRemoteRepo(repo, Tree.getDefaultInstance(), "marker")).isTrue();
+      assertThat(overlay.injectRemoteRepo(repo, Tree.getDefaultInstance(), "marker", future -> {})).isTrue();
       var delayedRepo = mock(RepositoryName.class);
       when(delayedRepo.getMarkerFileName()).thenReturn(repo.getMarkerFileName());
       var calls = new AtomicInteger();

@@ -159,6 +159,22 @@ class WorkerSkyFunctionEnvironment
     delegate.dependOnFuture(future);
   }
 
+  /**
+   * Blocks the worker until {@code future} is done, letting the host thread return to Skyframe in
+   * the meantime: the host SkyFunction restarts once the future completes and hands over a fresh
+   * Environment.
+   */
+  void awaitWithoutHost(ListenableFuture<?> future) throws InterruptedException {
+    if (future.isDone()) {
+      return;
+    }
+    delegate.dependOnFuture(future);
+    // We null out `delegate` before blocking for the fresh env so that the old one becomes
+    // eligible for GC.
+    delegate = null;
+    delegate = newDelegateSupplier.get();
+  }
+
   @Override
   public SkyframeLookupResult getLookupHandleForPreviouslyRequestedDeps() {
     return delegate.getLookupHandleForPreviouslyRequestedDeps();
