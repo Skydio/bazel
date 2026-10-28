@@ -140,6 +140,22 @@ public class WorkerSkyKeyComputeState<T> implements SkyKeyComputeState {
   }
 
   /**
+   * Waits for {@code future} on behalf of a SkyFunction and returns its value.
+   *
+   * <p>On a worker thread started by this class, the host Skyframe thread is released while the
+   * future is pending instead of blocking along with the worker, so that work waiting on the
+   * network, such as repo fetches, doesn't occupy the Skyframe thread pool. With any other {@code
+   * env}, this simply blocks.
+   */
+  public static <V> V await(Environment env, ListenableFuture<V> future)
+      throws InterruptedException, ExecutionException {
+    if (env instanceof WorkerSkyFunctionEnvironment workerEnv) {
+      workerEnv.awaitWithoutHost(future);
+    }
+    return future.get();
+  }
+
+  /**
    * Returns the worker future, or if a worker is not already running, starts a worker thread
    * running the given callable. This makes sure to release a permit on the {@code signalSemaphore}
    * when the worker finishes, successfully or otherwise. This may only be called from the host

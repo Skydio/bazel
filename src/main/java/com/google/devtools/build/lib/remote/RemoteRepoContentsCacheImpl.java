@@ -20,6 +20,7 @@ import static com.google.common.util.concurrent.Futures.immediateFuture;
 import static com.google.common.util.concurrent.Futures.transformAsync;
 import static com.google.common.util.concurrent.Futures.whenAllSucceed;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
+import static com.google.devtools.build.lib.remote.util.Utils.getFromFuture;
 import static com.google.devtools.build.lib.remote.util.Utils.waitForBulkTransfer;
 import static com.google.devtools.build.lib.unsafe.StringUnsafe.getInternalStringBytes;
 import static java.nio.charset.StandardCharsets.ISO_8859_1;
@@ -64,12 +65,14 @@ import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.skyframe.SkyFunction;
+import com.google.devtools.build.skyframe.WorkerSkyKeyComputeState;
 import com.google.protobuf.ByteString;
 import java.io.IOException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
 import java.util.SortedMap;
 import java.util.UUID;
 import javax.annotation.Nullable;
@@ -275,6 +278,7 @@ public final class RemoteRepoContentsCacheImpl implements RemoteRepoContentsCach
                 context, REPO_DIRECTORY_PATH, /* execPath= */ null, repoDirectory.getTreeDigest()),
             (treeBytes) -> immediateFuture(Tree.parseFrom(treeBytes)),
             directExecutor());
+    awaitDone(env, ImmutableList.of(markerFileContentFuture, repoDirectoryContentFuture));
     waitForBulkTransfer(ImmutableList.of(markerFileContentFuture, repoDirectoryContentFuture));
 
     String markerFileContent = new String(markerFileContentFuture.resultNow(), ISO_8859_1);
@@ -294,7 +298,10 @@ public final class RemoteRepoContentsCacheImpl implements RemoteRepoContentsCach
     }
 
     return remoteFs.injectRemoteRepo(
-        repoName, repoDirectoryContentFuture.resultNow(), markerFileContent);
+        repoName,
+        repoDirectoryContentFuture.resultNow(),
+        markerFileContent,
+        future -> awaitDone(env, ImmutableList.of(future)));
   }
 
   private enum CacheOp {
@@ -492,9 +499,11 @@ public final class RemoteRepoContentsCacheImpl implements RemoteRepoContentsCach
     // The marker file is read right after and thus requested to be inlined. If the action result
     // is an intermediate node, the full result will be contained in the stdout, which should thus
     // also be inlined.
-    var cachedActionResult =
-        cache.downloadActionResult(
+    var cachedActionResultFuture =
+        cache.downloadActionResultAsync(
             context, actionKey, /* inlineOutErr= */ true, ImmutableSet.of(MARKER_FILE_PATH));
+    awaitDone(env, ImmutableList.of(cachedActionResultFuture));
+    var cachedActionResult = getFromFuture(cachedActionResultFuture);
     if (cachedActionResult == null) {
       return new CacheEntry.Intermediate(ImmutableList.of());
     }
@@ -520,6 +529,7 @@ public final class RemoteRepoContentsCacheImpl implements RemoteRepoContentsCach
               .formatted(context.getRequestMetadata().getActionId(), actionResult));
     }
     var stdoutFuture = fetchStdout(context, actionResult);
+    awaitDone(env, ImmutableList.of(stdoutFuture));
     waitForBulkTransfer(ImmutableList.of(stdoutFuture));
 
     // The action result's stdout contains multiple lines, each representing a batch of
@@ -566,6 +576,22 @@ public final class RemoteRepoContentsCacheImpl implements RemoteRepoContentsCach
         .addString(hash)
         .addString(inputWithValue.toString())
         .hexDigestAndReset();
+  }
+
+  /**
+   * Waits for the given futures to be done, successfully or not, without occupying a Skyframe
+   * thread when called on a repo fetch worker thread.
+   */
+  private static void awaitDone(
+      SkyFunction.Environment env, ImmutableList<? extends ListenableFuture<?>> futures)
+      throws InterruptedException {
+    try {
+      var unused =
+          WorkerSkyKeyComputeState.await(
+              env, Futures.whenAllComplete(futures).call(() -> null, directExecutor()));
+    } catch (ExecutionException e) {
+      throw new IllegalStateException("whenAllComplete with a null callable can't fail", e);
+    }
   }
 
   private ListenableFuture<String> fetchStdout(
