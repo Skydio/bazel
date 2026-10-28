@@ -45,15 +45,19 @@ public class DigestWriter {
   // when we decide to update the format.
   private static final int MARKER_FILE_VERSION = 7;
 
+  private static final String REPRODUCIBLE_SUFFIX = ".reproducible";
+
   private final BlazeDirectories directories;
   final String predeclaredInputHash;
   final Path markerPath;
+  private final Path reproduciblePath;
 
   private DigestWriter(
       BlazeDirectories directories, RepositoryName repositoryName, String predeclaredInputHash) {
     this.directories = directories;
     this.predeclaredInputHash = predeclaredInputHash;
     this.markerPath = getMarkerPath(directories, repositoryName);
+    this.reproduciblePath = getReproduciblePath(directories, repositoryName);
   }
 
   /** Returns null if and only if a Skyframe restart is needed. */
@@ -214,9 +218,28 @@ public class DigestWriter {
         .getChild(repo.getMarkerFileName());
   }
 
+  /**
+   * Returns the path of the file whose presence records that the repo's current contents were
+   * produced by a reproducible fetch, i.e. are determined by its marker file. It is written for
+   * reproducible fetches and remote repo contents cache hits, and removed with the marker file.
+   */
+  public static Path getReproduciblePath(BlazeDirectories directories, RepositoryName repo) {
+    return RepositoryUtils.getExternalRepositoryDirectory(directories)
+        .getChild("@" + repo.getName() + REPRODUCIBLE_SUFFIX);
+  }
+
+  void markReproducible() throws RepositoryFunctionException {
+    try {
+      FileSystemUtils.writeContent(reproduciblePath, ISO_8859_1, "");
+    } catch (IOException e) {
+      throw new RepositoryFunctionException(e, Transience.TRANSIENT);
+    }
+  }
+
   static void clearMarkerFile(BlazeDirectories directories, RepositoryName repo)
       throws RepositoryFunctionException {
     try {
+      getReproduciblePath(directories, repo).delete();
       getMarkerPath(directories, repo).delete();
     } catch (IOException e) {
       throw new RepositoryFunctionException(e, Transience.TRANSIENT);

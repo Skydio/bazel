@@ -16,6 +16,7 @@ package com.google.devtools.build.lib.query2.query.hash;
 import com.google.common.collect.ImmutableList;
 import com.google.common.io.BaseEncoding;
 import com.google.devtools.build.lib.analysis.BlazeDirectories;
+import com.google.devtools.build.lib.bazel.repository.DigestWriter;
 import com.google.devtools.build.lib.bazel.repository.RepoDefinition;
 import com.google.devtools.build.lib.bazel.repository.RepoDefinitionValue;
 import com.google.devtools.build.lib.bazel.repository.cache.LocalRepoContentsCache;
@@ -44,31 +45,35 @@ import java.util.List;
 import javax.annotation.Nullable;
 
 /**
- * Computes a single digest of the contents of an external repository, for {@code
- * --generate_hashes}.
+ * Computes a single digest of an external repository, for {@code --generate_hashes}.
  *
  * <p>The contents of a repo fetched by a repo rule that is neither {@code local} nor {@code
  * configure} only change when Bazel refetches it, and a refetch invalidates the repo's {@link
- * RepositoryDirectoryValue}. Such a repo can therefore be hashed as one unit, read once per fetch
- * with direct filesystem calls, instead of tracking each of its files in Skyframe. That matters for
- * toolchain repos with hundreds of thousands of files, which Bazel would otherwise check for
- * changes on every command. Edits made by hand inside such a repo are not seen.
+ * RepositoryDirectoryValue}. Such a repo can therefore be hashed as one unit instead of tracking
+ * each of its files in Skyframe. That matters for toolchain repos with hundreds of thousands of
+ * files, which Bazel would otherwise check for changes on every command. Edits made by hand inside
+ * such a repo are not seen.
  *
- * <p>The executable bit of files is not part of the digest: the same repo reports different
- * executable bits depending on whether it was fetched locally or is served lazily from the remote
- * repo contents cache.
+ * <p>A repo whose contents came from a reproducible fetch is hashed by its marker file, which
+ * records the predeclared inputs of its repo rule (Bazel version, flags, repo rule definition and
+ * attributes) and the values of every input it read. Reproducibility means that the marker
+ * determines the contents, which is what the local and remote repo contents caches rely on too, so
+ * the repo's files are not read at all. The marker is the same whether the repo was fetched, is
+ * served from the local repo contents cache (as the entry's recorded inputs) or from the remote one
+ * (held in memory), so all three hash the same. Unlike a content digest, this changes the hash when
+ * the repo's inputs change but its files come out the same.
  *
- * <p>Repo rules often create absolute symlinks into the output base or the workspace, and Bazel
- * only makes them relative for reproducible repos. To keep the digest independent of where the
- * output base and the workspace are, absolute symlink targets under them are hashed relative to
- * them. Symlinks into the workspace are also hashed by the contents of the files they point to:
- * Bazel refetches the repo when such a file changes (if the repo rule watches it), but the symlink
- * itself stays the same.
+ * <p>Other repos are hashed by their contents, read once per fetch with direct filesystem calls.
+ * The executable bit of files is not part of that digest. Repo rules often create absolute
+ * symlinks into the output base or the workspace, and Bazel only makes them relative for
+ * reproducible repos. To keep the digest independent of where the output base and the workspace
+ * are, absolute symlink targets under them are hashed relative to them. Symlinks into the workspace
+ * are also hashed by the contents of the files they point to: Bazel refetches the repo when such a
+ * file changes (if the repo rule watches it), but the symlink itself stays the same.
  *
- * <p>Reading every file of every fetched repo dominates the cost of a cold server, so the digest is
- * persisted next to the repo's marker file, as {@code @<repo>.content_digest}, keyed by an identity
- * of the fetch that includes the marker. A new server reads it back instead of the repo's files, as
- * long as the repo has not been refetched since.
+ * <p>The content digest is persisted next to the repo's marker file, as {@code
+ * @<repo>.content_digest}, keyed by an identity of the fetch that includes the marker. A new server
+ * reads it back instead of the repo's files, as long as the repo has not been refetched since.
  *
  * <p>For other repos (the main repo, {@code local} and {@code configure} repos, and overridden
  * repos), {@link Value#usesFileDigests} is true and source files are hashed individually by {@link
@@ -176,6 +181,11 @@ public final class RepoContentDigestFunction implements SkyFunction {
     Path root = success.root().asPath();
     Path externalRoot =
         directories.getOutputBase().getRelative(LabelConstants.EXTERNAL_REPOSITORY_LOCATION);
+    @Nullable String marker = reproducibleMarker(repo, root, externalRoot);
+    if (marker != null) {
+      return new Value(
+          new Fingerprint().addString("<marker>").addString(marker).digestAndReset());
+    }
     Path digestFile = externalRoot.getChild("@" + repo.getName() + DIGEST_FILE_SUFFIX);
     @Nullable String fetchIdentity = fetchIdentity(repo, root, externalRoot);
     if (fetchIdentity != null) {
@@ -206,21 +216,17 @@ public final class RepoContentDigestFunction implements SkyFunction {
   }
 
   /**
-   * Returns a string that differs between any two fetches of {@code repo} that can produce different
-   * files, or null if there is none and the repo's digest must not be persisted.
-   *
-   * <p>Every case includes the repo's marker file, which records the inputs of its repo rule
-   * (definition, and the contents of the files and directories it read, such as the patches and
-   * overlay files of a local registry module).
+   * Returns the contents of the marker file of {@code repo} if its contents came from a
+   * reproducible fetch, or null otherwise.
    */
   @Nullable
-  private static String fetchIdentity(RepositoryName repo, Path root, Path externalRoot) {
+  private String reproducibleMarker(RepositoryName repo, Path root, Path externalRoot) {
     try {
       if (root.getFileSystem() instanceof InMemoryRepoMarkerFiles inMemory) {
         String marker = inMemory.getInMemoryMarkerFileContents(repo.getName());
         if (marker != null) {
-          // Served from the remote repo contents cache, whose entries are addressed by the marker.
-          return identity("remote_repo_contents_cache", marker);
+          // Served from the remote repo contents cache, which only holds reproducible repos.
+          return marker;
         }
       }
       FileStatus status = root.statIfFound(Symlinks.NOFOLLOW);
@@ -228,17 +234,40 @@ public final class RepoContentDigestFunction implements SkyFunction {
         return null;
       }
       if (status.isSymbolicLink()) {
-        // Served from the repo contents cache. An entry is never modified, and Bazel moves the
-        // repo's marker file next to it.
+        // Served from the local repo contents cache, which only holds reproducible repos. An entry
+        // is never modified, and Bazel moves the repo's marker file next to it.
         Path entry = root.resolveSymbolicLinks();
         Path recordedInputs =
             entry
                 .getParentDirectory()
                 .getChild(entry.getBaseName() + LocalRepoContentsCache.RECORDED_INPUTS_SUFFIX);
-        if (!recordedInputs.isFile()) {
-          return null;
-        }
-        return identity("repo_contents_cache", entry.getPathString(), readLatin1(recordedInputs));
+        return recordedInputs.isFile() ? readLatin1(recordedInputs) : null;
+      }
+      Path marker = externalRoot.getChild(repo.getMarkerFileName());
+      if (!DigestWriter.getReproduciblePath(directories, repo).exists() || !marker.isFile()) {
+        return null;
+      }
+      return readLatin1(marker);
+    } catch (IOException e) {
+      return null;
+    }
+  }
+
+  /**
+   * Returns a string that differs between any two fetches of {@code repo} into the external
+   * directory that can produce different files, or null if there is none and the repo's digest must
+   * not be persisted.
+   *
+   * <p>It includes the repo's marker file, which records the inputs of its repo rule (definition,
+   * and the contents of the files and directories it read, such as the patches and overlay files of
+   * a local registry module).
+   */
+  @Nullable
+  private static String fetchIdentity(RepositoryName repo, Path root, Path externalRoot) {
+    try {
+      FileStatus status = root.statIfFound(Symlinks.NOFOLLOW);
+      if (status == null || status.isSymbolicLink()) {
+        return null;
       }
       Path marker = externalRoot.getChild(repo.getMarkerFileName());
       if (!marker.isFile()) {
