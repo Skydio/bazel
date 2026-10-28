@@ -179,6 +179,7 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
             rctx.file("b.txt", "b")
             rctx.watch(rctx.attr.linked)
             rctx.symlink(rctx.attr.linked, "linked.txt")
+            return rctx.repo_metadata(reproducible = rctx.attr.reproducible)
 
         _ATTRS = {
             "content": attr.string(),
@@ -186,6 +187,7 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
             "patch": attr.label(),
             "template": attr.label(default = "//tc:template.txt"),
             "linked": attr.label(default = "//tc:linked.txt"),
+            "reproducible": attr.bool(),
         }
 
         content_repo = repository_rule(implementation = _impl, attrs = _ATTRS)
@@ -213,6 +215,16 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
         "content_repo = use_repo_rule('//defs:repos.bzl', 'content_repo')",
         String.format(
             "content_repo(name = 'ext', content = '%s', unused = '%s', patch = '//tc:patch.txt')",
+            content, unused));
+  }
+
+  private void writeReproducibleModuleFile(String content, String unused) throws Exception {
+    rewriteModuleDotBazel(
+        "register_toolchains('//tc:all')",
+        "content_repo = use_repo_rule('//defs:repos.bzl', 'content_repo')",
+        String.format(
+            "content_repo(name = 'ext', content = '%s', unused = '%s', patch = '//tc:patch.txt',"
+                + " reproducible = True)",
             content, unused));
   }
 
@@ -520,5 +532,77 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
         "local_content_repo = use_repo_rule('//defs:repos.bzl', 'local_content_repo')",
         "local_content_repo(name = 'local_ext', content = 'changed')");
     assertThat(hashes(user)).isNotEqualTo(before);
+  }
+
+  private ImmutableList<Path> reproducibleFiles() throws Exception {
+    Path external = directories.getOutputBase().getRelative("external");
+    return external.getDirectoryEntries().stream()
+        .filter(path -> path.getBaseName().endsWith(".reproducible"))
+        .collect(ImmutableList.toImmutableList());
+  }
+
+  @Test
+  public void reproducibleRepo_isHashedByItsMarkerWithoutAContentDigest() throws Exception {
+    writeReproducibleModuleFile(/* content= */ "a", /* unused= */ "1");
+
+    ImmutableMap<Label, String> hashes = extHashes();
+
+    assertThat(hashes).isNotEmpty();
+    assertThat(reproducibleFiles()).hasSize(1);
+    assertThat(persistedDigestFiles()).isEmpty();
+  }
+
+  @Test
+  public void reproducibleRepoContentChange_affectsDependents() throws Exception {
+    writeReproducibleModuleFile(/* content= */ "a", /* unused= */ "1");
+    ImmutableMap<Label, String> before = extHashes();
+
+    writeReproducibleModuleFile(/* content= */ "changed", /* unused= */ "1");
+
+    assertThat(extHashes()).isNotEqualTo(before);
+  }
+
+  @Test
+  public void reproducibleRepoRefetchedWithSameContents_affectsDependents() throws Exception {
+    writeReproducibleModuleFile(/* content= */ "a", /* unused= */ "1");
+    ImmutableMap<Label, String> before = extHashes();
+
+    // The marker changes with the definition even though the repo's files are identical.
+    writeReproducibleModuleFile(/* content= */ "a", /* unused= */ "2");
+
+    assertThat(extHashes()).isNotEqualTo(before);
+  }
+
+  @Test
+  public void reproducibleRepoWatchedFileChange_affectsDependents() throws Exception {
+    writeReproducibleModuleFile(/* content= */ "a", /* unused= */ "1");
+    ImmutableMap<Label, String> before = extHashes();
+
+    scratch.overwriteFile("tc/linked.txt", "relinked");
+    invalidatePackages();
+
+    assertThat(extHashes()).isNotEqualTo(before);
+  }
+
+  @Test
+  public void reproducibleRepoHash_isUnchangedAfterHashValuesAreDropped() throws Exception {
+    writeReproducibleModuleFile(/* content= */ "a", /* unused= */ "1");
+    ImmutableMap<Label, String> before = extHashes();
+
+    dropHashValues();
+
+    assertThat(extHashes()).isEqualTo(before);
+  }
+
+  @Test
+  public void repoNoLongerReproducible_isHashedByItsContents() throws Exception {
+    writeReproducibleModuleFile(/* content= */ "a", /* unused= */ "1");
+    var unused = extHashes();
+
+    writeModuleFile(/* content= */ "a", /* unused= */ "1");
+    var unused2 = extHashes();
+
+    assertThat(reproducibleFiles()).isEmpty();
+    assertThat(persistedDigestFiles()).hasSize(1);
   }
 }
