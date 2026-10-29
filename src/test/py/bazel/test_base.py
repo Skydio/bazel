@@ -72,9 +72,8 @@ class TestBase(absltest.TestCase):
   _temp = None
   _tests_root = None
   _test_cwd = None
-  _worker_stdout = None
-  _worker_stderr = None
-  _worker_proc = None
+  # The (process, stdout, stderr, CAS path) of each running local remote worker.
+  _workers = ()
   _cas_path = None
 
   def setUp(self):
@@ -443,11 +442,14 @@ class TestBase(absltest.TestCase):
   def StartRemoteWorker(self):
     """Runs a "local remote worker" to run remote builds and tests on.
 
+    Each call starts another worker with its own CAS. ClearRemoteCache and
+    DeleteCasEntry act on the CAS of the first one.
+
     Returns:
       int: port that the local remote worker runs on.
     """
-    self._worker_stdout = tempfile.TemporaryFile(dir=self._test_cwd)
-    self._worker_stderr = tempfile.TemporaryFile(dir=self._test_cwd)
+    stdout = tempfile.TemporaryFile(dir=self._test_cwd)
+    stderr = tempfile.TemporaryFile(dir=self._test_cwd)
     if TestBase.IsWindows():
       # Ideally we would use something under TEST_TMPDIR here, but the
       # worker path must be as short as possible so we don't exceed Windows
@@ -458,8 +460,8 @@ class TestBase(absltest.TestCase):
     else:
       worker_path = tempfile.mkdtemp(dir=self._tests_root)
       worker_exe = self.Rlocation('io_bazel/src/tools/remote/worker')
-    self._cas_path = os.path.join(worker_path, 'cas')
-    os.mkdir(self._cas_path)
+    cas_path = os.path.join(worker_path, 'cas')
+    os.mkdir(cas_path)
 
     # Get an open port. Unfortunately this seems to be the best option in
     # Python.
@@ -469,7 +471,7 @@ class TestBase(absltest.TestCase):
     s.close()
 
     # Tip: To help debug remote build problems, add the --debug flag below.
-    self._worker_proc = subprocess.Popen(
+    proc = subprocess.Popen(
         [
             worker_exe,
             '--singlejar',
@@ -477,43 +479,44 @@ class TestBase(absltest.TestCase):
             # This path has to be extremely short to avoid Windows path
             # length restrictions.
             '--work_path=' + worker_path,
-            '--cas_path=' + self._cas_path,
+            '--cas_path=' + cas_path,
         ],
-        stdout=self._worker_stdout,
-        stderr=self._worker_stderr,
+        stdout=stdout,
+        stderr=stderr,
         cwd=self._test_cwd,
         env=self._EnvMap(env_add=self._runfiles.EnvVars()),
     )
+    if not self._workers:
+      self._cas_path = cas_path
+    self._workers = (*self._workers, (proc, stdout, stderr, cas_path))
 
     return port
 
   def StopRemoteWorker(self):
-    """Stop the "local remote worker" started by StartRemoteWorker.
+    """Stop the "local remote workers" started by StartRemoteWorker.
 
-    Prints its stdout and stderr out for debug purposes.
+    Prints their stdout and stderr out for debug purposes.
     """
-    self._worker_proc.terminate()
-    self._worker_proc.wait()
+    for proc, stdout, stderr, cas_path in self._workers:
+      proc.terminate()
+      proc.wait()
 
-    self._worker_stdout.seek(0)
-    stdout_lines = [
-        l.decode('utf-8').strip() for l in self._worker_stdout.readlines()
-    ]
-    if stdout_lines:
-      print('Local remote worker stdout')
-      print('--------------------------')
-      print('\n'.join(stdout_lines))
+      stdout.seek(0)
+      stdout_lines = [l.decode('utf-8').strip() for l in stdout.readlines()]
+      if stdout_lines:
+        print('Local remote worker stdout')
+        print('--------------------------')
+        print('\n'.join(stdout_lines))
 
-    self._worker_stderr.seek(0)
-    stderr_lines = [
-        l.decode('utf-8').strip() for l in self._worker_stderr.readlines()
-    ]
-    if stderr_lines:
-      print('Local remote worker stderr')
-      print('--------------------------')
-      print('\n'.join(stderr_lines))
+      stderr.seek(0)
+      stderr_lines = [l.decode('utf-8').strip() for l in stderr.readlines()]
+      if stderr_lines:
+        print('Local remote worker stderr')
+        print('--------------------------')
+        print('\n'.join(stderr_lines))
 
-    shutil.rmtree(self._cas_path)
+      shutil.rmtree(cas_path)
+    self._workers = ()
 
   def ClearRemoteCache(self):
     """Clears the CAS of the "local remote worker"."""
