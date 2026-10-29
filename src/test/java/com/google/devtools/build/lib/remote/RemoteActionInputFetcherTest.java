@@ -190,6 +190,7 @@ public class RemoteActionInputFetcherTest extends ActionInputPrefetcherTestBase 
         new RemoteExternalOverlayFileSystem(externalDir, hostFs);
     overlayFs.beforeCommand(
         newCombinedCache(digestUtil, new HashMap<>()),
+        new RemoteExternalOverlayFileSystem.CacheIdentity("grpc://cache", null, null),
         /* inputPrefetcher= */ null,
         new Reporter(EventBusEventHandler.createWithNewEventBus()),
         "none",
@@ -240,7 +241,14 @@ public class RemoteActionInputFetcherTest extends ActionInputPrefetcherTestBase 
             ActionOutputDirectoryHelper.createForTesting(),
             OutputPermissions.WRITABLE);
     overlayFs.beforeCommand(
-        cache, prefetcher, reporter, "none", "none", () -> null, Duration.ofHours(1));
+        cache,
+        new RemoteExternalOverlayFileSystem.CacheIdentity("grpc://cache", null, null),
+        prefetcher,
+        reporter,
+        "none",
+        "none",
+        () -> null,
+        Duration.ofHours(1));
     try {
       var root = Directory.newBuilder();
       for (String name : ImmutableList.of("plain.txt", "run.sh", "helper.bzl")) {

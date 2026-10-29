@@ -100,6 +100,9 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem implements
   // externalFs.
   private final ConcurrentHashMap<String, String> markerFileContents = new ConcurrentHashMap<>();
   private final Set<String> reposWithLostFiles = ConcurrentHashMap.newKeySet();
+  // The caches that the repos in markerFileContents were injected from. Only the digests of their
+  // files are kept in memory, so they can't be read from other caches.
+  @Nullable private CacheIdentity inMemoryReposCache;
 
   // Per-build information that is set in beforeCommand and cleared in afterCommand.
   @Nullable private CombinedCache cache;
@@ -111,6 +114,15 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem implements
   @Nullable private Duration remoteCacheTtl;
   @Nullable private ListeningExecutorService materializationExecutor;
 
+  /**
+   * Identifies the caches that a command reads the files of in-memory repos from. A file that is
+   * available from one set of caches need not be available from another.
+   */
+  public record CacheIdentity(
+      @Nullable String remoteCache,
+      @Nullable String remoteInstanceName,
+      @Nullable PathFragment diskCache) {}
+
   public RemoteExternalOverlayFileSystem(PathFragment externalDirectory, FileSystem nativeFs) {
     super(nativeFs.getDigestFunction());
     this.externalDirectory = externalDirectory;
@@ -121,6 +133,7 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem implements
 
   public void beforeCommand(
       CombinedCache cache,
+      CacheIdentity cacheIdentity,
       AbstractActionInputPrefetcher inputPrefetcher,
       Reporter reporter,
       String buildRequestId,
@@ -136,6 +149,14 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem implements
             && this.evaluator == null
             && this.remoteCacheTtl == null
             && this.materializationExecutor == null);
+    if (!cacheIdentity.equals(inMemoryReposCache)) {
+      // The in-memory repos were injected from other caches, which may hold files that the caches
+      // of this command don't. Refetching them looks them up in the current caches.
+      if (!markerFileContents.isEmpty()) {
+        discardInMemoryRepos(evaluator.get());
+      }
+      inMemoryReposCache = cacheIdentity;
+    }
     this.cache = cache;
     this.inputPrefetcher = inputPrefetcher;
     this.reporter = reporter;
@@ -517,6 +538,15 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem implements
    */
   public void notifyNoCacheAvailable(MemoizingEvaluator evaluator) {
     checkState(materializationExecutor == null, "must not be called when active");
+    discardInMemoryRepos(evaluator);
+    inMemoryReposCache = null;
+  }
+
+  /**
+   * Drops the contents of all repos that are only available in memory and invalidates their
+   * fetches.
+   */
+  private void discardInMemoryRepos(MemoizingEvaluator evaluator) {
     var reposToDiscard = ImmutableSet.copyOf(markerFileContents.keySet());
     reposToDiscard.forEach(this::evictInMemoryRepo);
     invalidateRepoDirectories(evaluator, reposToDiscard);

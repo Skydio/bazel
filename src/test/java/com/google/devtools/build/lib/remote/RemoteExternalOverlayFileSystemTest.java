@@ -59,6 +59,7 @@ public final class RemoteExternalOverlayFileSystemTest {
     when(prefetcher.isAvailable(any(), any())).thenCallRealMethod();
     overlay.beforeCommand(
         new InMemoryCombinedCache(digestUtil),
+        new RemoteExternalOverlayFileSystem.CacheIdentity("grpc://cache", null, null),
         prefetcher,
         new Reporter(),
         "build-request",
@@ -116,6 +117,7 @@ public final class RemoteExternalOverlayFileSystemTest {
     when(prefetcher.isAvailable(any(), any())).thenCallRealMethod();
     overlay.beforeCommand(
         new InMemoryCombinedCache(cacheClient, digestUtil),
+        new RemoteExternalOverlayFileSystem.CacheIdentity("grpc://cache", null, null),
         prefetcher,
         new Reporter(),
         "build-request",
@@ -169,6 +171,7 @@ public final class RemoteExternalOverlayFileSystemTest {
         .thenReturn(immediateVoidFuture());
     overlay.beforeCommand(
         cache,
+        new RemoteExternalOverlayFileSystem.CacheIdentity("grpc://cache", null, null),
         prefetcher,
         reporter,
         "build-request",
@@ -225,6 +228,7 @@ public final class RemoteExternalOverlayFileSystemTest {
             });
     overlay.beforeCommand(
         cache,
+        new RemoteExternalOverlayFileSystem.CacheIdentity("grpc://cache", null, null),
         prefetcher,
         reporter,
         "build-request",
