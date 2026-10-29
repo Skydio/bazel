@@ -152,11 +152,17 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem
                 Thread.ofVirtual().name("remote-repo-materialization-", 0).factory()));
   }
 
-  public void afterCommand() {
+  /**
+   * Cleans up after a command.
+   *
+   * @return whether the remote cache has lost files of repos during the command. The fetches of
+   *     these repos are invalidated, so that the next command fetches them again.
+   */
+  public boolean afterCommand() {
     if (cache == null) {
       // Not all commands cause beforeCommand to be called, but afterCommand is called
       // unconditionally.
-      return;
+      return false;
     }
 
     // Uninterruptibly await the termination of all ongoing materializations to prevent cleanup
@@ -179,8 +185,10 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem
     reposWithLostFiles.forEach(this::evictInMemoryRepo);
     // The evaluator may have been replaced during the command.
     invalidateRepoDirectories(evaluator.get(), reposWithLostFiles);
+    boolean lostFiles = !reposWithLostFiles.isEmpty();
     reposWithLostFiles.clear();
     this.evaluator = null;
+    return lostFiles;
   }
 
   /** Removes the contents of the given repo from the in-memory overlay file system. */

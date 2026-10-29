@@ -29,6 +29,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
+import com.google.common.eventbus.Subscribe;
 import com.google.common.util.concurrent.ListeningScheduledExecutorService;
 import com.google.common.util.concurrent.MoreExecutors;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
@@ -86,6 +87,7 @@ import com.google.devtools.build.lib.runtime.BlockWaitingModule;
 import com.google.devtools.build.lib.runtime.BuildEventArtifactUploaderFactory;
 import com.google.devtools.build.lib.runtime.CommandEnvironment;
 import com.google.devtools.build.lib.runtime.CommandLinePathFactory;
+import com.google.devtools.build.lib.runtime.CommandPrecompleteEvent;
 import com.google.devtools.build.lib.runtime.RemoteRepoContentsCache;
 import com.google.devtools.build.lib.runtime.RepositoryRemoteExecutor;
 import com.google.devtools.build.lib.runtime.RepositoryRemoteHelpersFactory;
@@ -158,6 +160,7 @@ public final class RemoteModule extends BlazeModule {
   @Nullable private RemoteOutputChecker remoteOutputChecker;
   @Nullable private RemoteOutputChecker lastRemoteOutputChecker;
   @Nullable private String lastBuildId;
+  @Nullable private ExitCode commandExitCode;
 
   private ChannelFactory channelFactory =
       new ChannelFactory() {
@@ -1094,8 +1097,13 @@ public final class RemoteModule extends BlazeModule {
     }
   }
 
+  @Subscribe
+  public void commandPrecomplete(CommandPrecompleteEvent event) {
+    commandExitCode = event.getExitCode();
+  }
+
   @Override
-  public void afterCommand() {
+  public void afterCommand() throws AbruptExitException {
     Preconditions.checkNotNull(blockWaitingModule, "blockWaitingModule must not be null");
 
     // Some cleanup tasks must wait until every other BlazeModule's afterCommand() has run, as
@@ -1122,10 +1130,15 @@ public final class RemoteModule extends BlazeModule {
 
     buildEventArtifactUploaderFactoryDelegate.reset();
     repositoryRemoteHelpersFactoryDelegate.reset();
+    boolean lostRepoFiles = false;
     if (env.getDirectories().getOutputBase().getFileSystem()
         instanceof RemoteExternalOverlayFileSystem remoteFs) {
-      remoteFs.afterCommand();
+      lostRepoFiles = remoteFs.afterCommand();
     }
+    ExitCode exitCode = commandExitCode;
+    commandExitCode = null;
+    // Only commands with ExecutionOptions are retried after an eviction.
+    boolean retriesEvictions = env.getOptions().getOptions(ExecutionOptions.class) != null;
     remoteDownloader = null;
     actionContextProvider = null;
     actionInputFetcher = null;
@@ -1135,6 +1148,24 @@ public final class RemoteModule extends BlazeModule {
     tempPathGenerator = null;
     rpcLogFile = null;
     remoteOutputChecker = null;
+
+    // A command that fails while reading a file of a repo that the remote cache has lost can fail
+    // with a code that doesn't report the loss, e.g. when the file is a BUILD file loaded during
+    // analysis. The fetches of such repos have been invalidated, so report the failure as an
+    // eviction to have the command retried with --experimental_remote_cache_eviction_retries.
+    if (lostRepoFiles
+        && retriesEvictions
+        && exitCode != null
+        && !exitCode.equals(ExitCode.SUCCESS)) {
+      throw new AbruptExitException(
+          DetailedExitCode.of(
+              FailureDetail.newBuilder()
+                  .setMessage("Files of external repositories have been lost by the remote cache")
+                  .setFilesystem(
+                      FailureDetails.Filesystem.newBuilder()
+                          .setCode(FailureDetails.Filesystem.Code.REMOTE_FILE_EVICTED))
+                  .build()));
+    }
   }
 
   private static void afterCommandTask(
