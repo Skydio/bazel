@@ -25,6 +25,9 @@ import java.net.SocketTimeoutException;
 import java.net.URLConnection;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import javax.annotation.Nullable;
 
 /**
  * Input stream that reconnects on read timeouts and errors.
@@ -35,6 +38,7 @@ import java.util.List;
 class RetryingInputStream extends InputStream {
 
   private static final int MAX_RESUMES = 3;
+  private static final Pattern CONTENT_RANGE = Pattern.compile("bytes (\\d+)-(\\d+)/(?:\\d+|\\*)");
 
   /** Lambda for establishing a connection. */
   interface Reconnector {
@@ -48,10 +52,27 @@ class RetryingInputStream extends InputStream {
   private long toto;
   private int resumes;
   private final ArrayList<Throwable> suppressed = new ArrayList<>();
+  // Where the body starts in the resource, and its last byte, when the response is a 206 to a
+  // Range the caller asked for. A resume has to ask for the rest of that range, not of the file.
+  private final long rangeStart;
+  private final String rangeEnd;
 
   RetryingInputStream(InputStream delegate, Reconnector reconnector) {
+    this(delegate, reconnector, null);
+  }
+
+  RetryingInputStream(
+      InputStream delegate, Reconnector reconnector, @Nullable String contentRange) {
     this.delegate = delegate;
     this.reconnector = reconnector;
+    Matcher range = CONTENT_RANGE.matcher(Strings.nullToEmpty(contentRange));
+    if (range.matches()) {
+      this.rangeStart = Long.parseLong(range.group(1));
+      this.rangeEnd = range.group(2);
+    } else {
+      this.rangeStart = 0;
+      this.rangeEnd = "";
+    }
   }
 
   @Override
@@ -118,14 +139,16 @@ class RetryingInputStream extends InputStream {
       if (amountRead == 0) {
         connection = reconnector.connect(cause, ImmutableMap.of());
       } else {
+        long offset = rangeStart + amountRead;
         connection =
             reconnector.connect(
                 cause,
-                ImmutableMap.of("Range", ImmutableList.of(String.format("bytes=%d-", amountRead))));
+                ImmutableMap.of(
+                    "Range", ImmutableList.of(String.format("bytes=%d-%s", offset, rangeEnd))));
         if (!Strings.nullToEmpty(connection.getHeaderField("Content-Range"))
-                .startsWith(String.format("bytes %d-", amountRead))) {
+                .startsWith(String.format("bytes %d-", offset))) {
           throw new IOException(String.format(
-              "Tried to reconnect at offset %,d but server didn't support it", amountRead));
+              "Tried to reconnect at offset %,d but server didn't support it", offset));
         }
       }
       delegate = new InterruptibleInputStream(connection.getInputStream());
