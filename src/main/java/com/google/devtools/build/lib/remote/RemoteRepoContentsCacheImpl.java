@@ -309,15 +309,8 @@ public final class RemoteRepoContentsCacheImpl implements RemoteRepoContentsCach
     // Don't upload local repo contents to the disk cache as the (local) `--repo_contents_cache` is
     // a better alternative for local caching. Do write through the disk cache for downloads from
     // the remote cache to speed up future usage.
-    //
-    // With a remote cache, don't read from the disk cache though: repo files are only downloaded
-    // when needed and thus usually missing from the disk cache, so a disk cache entry can refer to
-    // files that the remote cache has since evicted. The remote cache only returns entries whose
-    // files it still has.
-    var readCachePolicy =
-        cache.hasRemoteCache() ? CachePolicy.REMOTE_CACHE_ONLY : CachePolicy.ANY_CACHE;
     return RemoteActionExecutionContext.create(metadata)
-        .withReadCachePolicy(acceptCached ? readCachePolicy : CachePolicy.NO_CACHE)
+        .withReadCachePolicy(acceptCached ? CachePolicy.ANY_CACHE : CachePolicy.NO_CACHE)
         .withWriteCachePolicy(
             switch (cacheOp) {
               case DOWNLOAD -> CachePolicy.ANY_CACHE;
