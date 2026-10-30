@@ -15,6 +15,7 @@
 # pylint: disable=g-long-ternary
 # pylint: disable=g-bad-todo
 
+import hashlib
 import json
 import os
 import re
@@ -1976,6 +1977,135 @@ class RemoteRepoContentsCacheTest(test_base.TestBase):
     self.assertFalse(os.path.exists(os.path.join(repo_dir, 'root.txt')))
     self.assertFalse(os.path.exists(os.path.join(repo_dir, 'sub/BUILD')))
     self.assertTrue(os.path.exists(os.path.join(repo_dir, 'sub/sub.txt')))
+
+  def _setUpRepoLostDuringAnalysis(self):
+    """Sets up //:top, whose analysis loads a BUILD file of a cached repo.
+
+    Loading the file that defines the repo rule of @deleter retrieves @my_repo
+    from the cache. Fetching @deleter then makes the remote cache lose the
+    sub/BUILD file of @my_repo, which is only read afterwards, when //:top
+    depends on @my_repo//sub through an alias in @deleter.
+
+    Returns:
+      The path of the lost blob in the remote cache.
+    """
+    sub_build = "filegroup(name='sub', visibility=['//visibility:public'])"
+    digest = hashlib.sha256(sub_build.encode()).hexdigest()
+    blob_path = os.path.join(self._cas_path, 'cas', digest[:2], digest)
+    self.ScratchFile(
+        'MODULE.bazel',
+        [
+            'repo = use_repo_rule("//:repo.bzl", "repo")',
+            'repo(name = "my_repo")',
+            'deleter = use_repo_rule("//:deleter.bzl", "deleter")',
+            'deleter(name = "deleter")',
+        ],
+    )
+    self.ScratchFile(
+        'BUILD.bazel', ['filegroup(name = "top", srcs = ["@deleter//:sub"])']
+    )
+    self.ScratchFile(
+        'repo.bzl',
+        [
+            'def _repo_impl(rctx):',
+            '  rctx.file("BUILD", "filegroup(name=\'root\')")',
+            '  rctx.file("defs.bzl", "MARKER = 1")',
+            '  rctx.file("sub/BUILD", "%s")' % sub_build,
+            '  print("JUST FETCHED")',
+            '  return rctx.repo_metadata(reproducible=True)',
+            'repo = repository_rule(_repo_impl)',
+        ],
+    )
+    self.ScratchFile(
+        'deleter.bzl',
+        [
+            'load("@my_repo//:defs.bzl", "MARKER")',
+            'def _deleter_impl(rctx):',
+            '  if rctx.os.name.startswith("windows"):',
+            '    cmd = ["cmd.exe", "/c", "del", %s]'
+            % json.dumps(blob_path.replace('/', '\\')),
+            '  else:',
+            '    cmd = ["rm", %s]' % json.dumps(blob_path),
+            '  result = rctx.execute(cmd)',
+            '  if result.return_code != 0:',
+            '    fail(result.stderr)',
+            '  rctx.file(',
+            '    "BUILD",',
+            (
+                "    \"alias(name='sub', actual='%s',"
+                " visibility=['//visibility:public'])\" %"
+                ' Label("@my_repo//sub"),'
+            ),
+            '  )',
+            'deleter = repository_rule(_deleter_impl)',
+        ],
+    )
+
+    # First fetch: not cached
+    _, _, stderr = self.RunBazel(['build', '@my_repo//:root'])
+    self.assertIn('JUST FETCHED', '\n'.join(stderr))
+
+    # After expunging: cached
+    self.RunBazel(['clean', '--expunge'])
+    _, _, stderr = self.RunBazel(['build', '@my_repo//:root'])
+    self.assertNotIn('JUST FETCHED', '\n'.join(stderr))
+    self.assertTrue(os.path.exists(blob_path))
+    return blob_path
+
+  def _assertRetriedAfterLostBuildFile(self, stderr):
+    stderr = '\n'.join(stderr)
+    self.assertIn(
+        'sub/BUILD with digest',
+        stderr,
+    )
+    self.assertIn('is no longer available in the remote cache', stderr)
+    self.assertEqual(
+        1,
+        stderr.count(
+            'Found transient remote cache error, retrying the build...'
+        ),
+    )
+    self.assertIn('JUST FETCHED', stderr)
+
+  def testLostRemoteFile_buildFileOfDependency_retried(self):
+    self._setUpRepoLostDuringAnalysis()
+
+    _, _, stderr = self.RunBazel(['build', '//:top'])
+    self._assertRetriedAfterLostBuildFile(stderr)
+
+  def testLostRemoteFile_buildFileOfDependency_keepGoing_retried(self):
+    self._setUpRepoLostDuringAnalysis()
+
+    _, _, stderr = self.RunBazel(['build', '--keep_going', '//:top'])
+    self._assertRetriedAfterLostBuildFile(stderr)
+
+  def testLostRemoteFile_buildFileOfDependency_evaluatorReplaced_retried(self):
+    # The first command that tracks incremental state after one that doesn't
+    # replaces the Skyframe evaluator while it is running. The fetch of the repo
+    # with the lost file has to be invalidated in the new evaluator for the
+    # retry to fetch the repo again.
+    self.ScratchFile(
+        '.bazelrc',
+        ['common --noexperimental_check_external_repository_files'],
+        mode='a',
+    )
+    self._setUpRepoLostDuringAnalysis()
+    self.RunBazel(['build', '--notrack_incremental_state', '@my_repo//:root'])
+
+    _, _, stderr = self.RunBazel(['build', '//:top'])
+    self._assertRetriedAfterLostBuildFile(stderr)
+
+  def testLostRemoteFile_queryWithoutRetries_keepsExitCode(self):
+    self._setUpRepoLostDuringAnalysis()
+
+    exit_code, _, stderr = self.RunBazel(
+        ['query', '--keep_going', 'deps(//:top)'], allow_failure=True
+    )
+    self.AssertExitCode(exit_code, 3, stderr)
+
+    # The next command fetches the repo again.
+    _, _, stderr = self.RunBazel(['query', 'deps(//:top)'])
+    self.assertIn('JUST FETCHED', '\n'.join(stderr))
 
   def testMemoryPressureRestartDuringCachedFetch(self):
     # Regression test for a cached repo fetch that is interrupted by memory
