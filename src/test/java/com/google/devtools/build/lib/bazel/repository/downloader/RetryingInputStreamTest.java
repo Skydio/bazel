@@ -104,6 +104,27 @@ public class RetryingInputStreamTest {
 
   @Test
   @SuppressWarnings("unchecked")
+  public void readTimesOutInCallerRange_resumesWithinThatRange() throws Exception {
+    RetryingInputStream ranged =
+        new RetryingInputStream(delegate, reconnector, "bytes 8117-286233/300000");
+    when(delegate.read()).thenReturn(1).thenThrow(new SocketTimeoutException());
+    when(reconnector.connect(any(Throwable.class), any(ImmutableMap.class))).thenReturn(connection);
+    when(connection.getInputStream()).thenReturn(newDelegate);
+    when(newDelegate.read()).thenReturn(2);
+    when(connection.getHeaderField("Content-Range")).thenReturn("bytes 8118-286233/300000");
+    assertThat(ranged.read()).isEqualTo(1);
+    assertThat(ranged.read()).isEqualTo(2);
+    verify(reconnector)
+        .connect(
+            any(Throwable.class),
+            eq(ImmutableMap.of("Range", ImmutableList.of("bytes=8118-286233"))));
+    verify(delegate, times(2)).read();
+    verify(delegate).close();
+    verify(newDelegate).read();
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
   public void failureWhenNoBytesAreRead_doesntUseRange() throws Exception {
     when(delegate.read()).thenThrow(new SocketTimeoutException());
     when(newDelegate.read()).thenReturn(1);

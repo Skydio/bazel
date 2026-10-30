@@ -124,8 +124,9 @@ final class HttpConnectorMultiplexer {
               newUrl ->
                   new ImmutableMap.Builder<String, List<String>>()
                       .putAll(headerFunction.apply(newUrl))
+                      // A resume's Range replaces the one the caller sent.
                       .putAll(extraHeaders)
-                      .buildOrThrow());
+                      .buildKeepingLast());
         },
         type);
   }
