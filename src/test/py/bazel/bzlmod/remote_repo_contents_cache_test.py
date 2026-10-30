@@ -1977,67 +1977,6 @@ class RemoteRepoContentsCacheTest(test_base.TestBase):
     self.assertFalse(os.path.exists(os.path.join(repo_dir, 'sub/BUILD')))
     self.assertTrue(os.path.exists(os.path.join(repo_dir, 'sub/sub.txt')))
 
-  def testSwitchRemoteCacheInSameServer(self):
-    # Regression test for repos injected from one remote cache and kept in
-    # memory being read from another remote cache by a later command in the
-    # same server. The in-memory repos only record the digests of their files,
-    # which the other cache doesn't hold.
-    self.ScratchFile(
-        'MODULE.bazel',
-        [
-            'repo = use_repo_rule("//:repo.bzl", "repo")',
-            'repo(name = "my_repo")',
-        ],
-    )
-    self.ScratchFile('BUILD.bazel')
-    self.ScratchFile(
-        'repo.bzl',
-        [
-            'def _repo_impl(rctx):',
-            (
-                '  rctx.file("BUILD", "filegroup(name=\'root\','
-                " srcs=['root.txt'])\")"
-            ),
-            '  rctx.file("root.txt", "root")',
-            (
-                '  rctx.file("sub/BUILD", "filegroup(name=\'sub\','
-                " srcs=['sub.txt'])\")"
-            ),
-            '  rctx.file("sub/sub.txt", "sub")',
-            '  print("JUST FETCHED")',
-            '  return rctx.repo_metadata(reproducible=True)',
-            'repo = repository_rule(_repo_impl)',
-        ],
-    )
-
-    repo_dir = self.RepoDir('my_repo')
-
-    # Populate the first cache.
-    _, _, stderr = self.RunBazel(['build', '@my_repo//:root'])
-    self.assertIn('JUST FETCHED', '\n'.join(stderr))
-
-    # After expunging: injected from the first cache, sub/BUILD is only in
-    # memory.
-    self.RunBazel(['clean', '--expunge'])
-    _, _, stderr = self.RunBazel(['build', '@my_repo//:root'])
-    self.assertNotIn('JUST FETCHED', '\n'.join(stderr))
-    self.assertFalse(os.path.exists(os.path.join(repo_dir, 'sub/BUILD')))
-
-    # Load sub/BUILD in the same server with a second, empty cache. The repo
-    # must be looked up in that cache, which misses, and fetched again rather
-    # than read from a cache that never had its files.
-    other_worker_port = self.StartRemoteWorker()
-    _, _, stderr = self.RunBazel([
-        'build',
-        '@my_repo//sub:sub',
-        '--remote_cache=grpc://localhost:' + str(other_worker_port),
-        '--experimental_remote_cache_eviction_retries=0',
-    ])
-    stderr = '\n'.join(stderr)
-    self.assertNotIn('no longer available in the remote cache', stderr)
-    self.assertIn('JUST FETCHED', stderr)
-    self.assertTrue(os.path.exists(os.path.join(repo_dir, 'sub/BUILD')))
-
   def testMemoryPressureRestartDuringCachedFetch(self):
     # Regression test for a cached repo fetch that is interrupted by memory
     # pressure (Skyframe drops the fetch's WorkerSkyKeyComputeState, which

@@ -380,12 +380,6 @@ public final class RemoteModule extends BlazeModule {
         instanceof RemoteExternalOverlayFileSystem remoteFs) {
       remoteFs.beforeCommand(
           combinedCache,
-          new RemoteExternalOverlayFileSystem.CacheIdentity(
-              Strings.emptyToNull(remoteOptions.remoteCache),
-              Strings.emptyToNull(remoteOptions.remoteInstanceName),
-              CombinedCacheClientFactory.isDiskCache(remoteOptions)
-                  ? env.getWorkingDirectory().getRelative(remoteOptions.diskCache).asFragment()
-                  : null),
           actionInputFetcher,
           env.getReporter(),
           buildRequestId,

@@ -53,7 +53,6 @@ public final class RemoteExternalOverlayFileSystemTest {
         .thenReturn(immediateVoidFuture());
     overlay.beforeCommand(
         cache,
-        new RemoteExternalOverlayFileSystem.CacheIdentity("grpc://cache", null, null),
         prefetcher,
         reporter,
         "build-request",
