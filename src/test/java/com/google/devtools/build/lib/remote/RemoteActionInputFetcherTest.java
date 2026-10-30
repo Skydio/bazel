@@ -187,6 +187,7 @@ public class RemoteActionInputFetcherTest extends ActionInputPrefetcherTestBase 
         new RemoteExternalOverlayFileSystem(externalDir, hostFs);
     overlayFs.beforeCommand(
         newCombinedCache(digestUtil, new HashMap<>()),
+        new RemoteExternalOverlayFileSystem.CacheIdentity("grpc://cache", null, null),
         /* inputPrefetcher= */ null,
         new Reporter(new EventBus()),
         "none",
