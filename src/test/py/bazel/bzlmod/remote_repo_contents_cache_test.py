@@ -2869,6 +2869,69 @@ class RemoteRepoContentsCacheTest(test_base.TestBase):
         stderr,
     )
 
+  def testLostRemoteFile_diskCacheHit(self):
+    # Cache a repo in the remote cache, then look it up with a disk cache so
+    # that the disk cache's AC gets a copy of the entry, but not the repo file
+    # that is never read. Then lose that file in the remote cache and use it:
+    # the stale disk cache entry must not be used.
+    disk_cache = tempfile.mkdtemp(dir=self._tests_root)
+    self.ScratchFile(
+        'MODULE.bazel',
+        [
+            'repo = use_repo_rule("//:repo.bzl", "repo")',
+            'repo(name = "my_repo")',
+        ],
+    )
+    self.ScratchFile(
+        'BUILD.bazel',
+        [
+            'genrule(',
+            '  name = "out",',
+            '  srcs = ["@my_repo//:data.txt"],',
+            '  outs = ["out.txt"],',
+            '  cmd = "cat $< > $@",',
+            # Don't let a cached output hide the lost input.
+            '  tags = ["no-cache"],',
+            ')',
+        ],
+    )
+    self.ScratchFile(
+        'repo.bzl',
+        [
+            'def _repo_impl(rctx):',
+            '  rctx.file("BUILD", "exports_files([\'data.txt\'])")',
+            '  rctx.file("data.txt", "my_data")',
+            '  print("JUST FETCHED")',
+            '  return rctx.repo_metadata(reproducible=True)',
+            'repo = repository_rule(_repo_impl)',
+        ],
+    )
+    # CI uses --rewind_lost_inputs, which disables the integrity check of
+    # disk cache action results.
+    flags = ['--disk_cache=' + disk_cache, '--rewind_lost_inputs']
+
+    # First fetch: not cached, uploaded to the remote cache only.
+    _, _, stderr = self.RunBazel(['build', '//:out'] + flags)
+    self.assertIn('JUST FETCHED', '\n'.join(stderr))
+
+    # After expunging: cached in the remote cache and written through to the
+    # disk cache. Only the BUILD file is read.
+    self.RunBazel(['clean', '--expunge'])
+    _, _, stderr = self.RunBazel(['build', '--nobuild', '//:out'] + flags)
+    self.assertNotIn('JUST FETCHED', '\n'.join(stderr))
+
+    # Lose the repo file in the remote cache, which also invalidates the
+    # remote cache's entry for the repo.
+    self.DeleteCasEntry(b'my_data')
+
+    # After expunging: the disk cache's entry for the repo refers to the lost
+    # file, so the repo has to be refetched.
+    self.RunBazel(['clean', '--expunge'])
+    _, _, stderr = self.RunBazel(['build', '//:out'] + flags)
+    self.assertIn('JUST FETCHED', '\n'.join(stderr))
+    with open(self.Path('bazel-bin/out.txt')) as f:
+      self.assertEqual(f.read(), 'my_data')
+
 
 if __name__ == '__main__':
   absltest.main()
