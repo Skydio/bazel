@@ -19,6 +19,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.Assert.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -30,20 +31,30 @@ import com.google.common.collect.ImmutableList;
 import com.google.devtools.build.lib.actions.ActionInput;
 import com.google.devtools.build.lib.cmdline.RepositoryName;
 import com.google.devtools.build.lib.events.Reporter;
+import com.google.devtools.build.lib.remote.common.CacheNotFoundException;
 import com.google.devtools.build.lib.remote.util.DigestUtil;
 import com.google.devtools.build.lib.remote.util.InMemoryCacheClient;
+import com.google.devtools.build.lib.server.FailureDetails;
+import com.google.devtools.build.lib.skyframe.SkyFunctions;
+import com.google.devtools.build.lib.vfs.DetailedIOException;
 import com.google.devtools.build.lib.vfs.DigestHashFunction;
 import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.SyscallCache;
 import com.google.devtools.build.lib.vfs.inmemoryfs.InMemoryFileSystem;
 import com.google.devtools.build.skyframe.MemoizingEvaluator;
+import com.google.devtools.build.skyframe.SkyFunctionException.Transience;
+import com.google.devtools.build.skyframe.SkyFunctionName;
+import com.google.devtools.build.skyframe.SkyKey;
 import java.io.IOException;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
+import org.mockito.ArgumentMatchers;
 
 @RunWith(JUnit4.class)
 public final class RemoteExternalOverlayFileSystemTest {
@@ -154,6 +165,84 @@ public final class RemoteExternalOverlayFileSystemTest {
     } finally {
       overlay.afterCommand();
     }
+  }
+
+  @Test
+  public void handleLostInput_fileInRepo_failsTransientlyAndRefetchesRepo() throws Exception {
+    var digestUtil = new DigestUtil(SyscallCache.NO_CACHE, DigestHashFunction.SHA256);
+    var nativeFs = new InMemoryFileSystem(DigestHashFunction.SHA256);
+    var externalRoot = PathFragment.create("/output/external");
+    var overlay = new RemoteExternalOverlayFileSystem(externalRoot, nativeFs);
+    // The evaluator applies the predicate when delete is called, as the overlay reuses the set of
+    // repos it refers to.
+    var deletedKeys = new ArrayList<SkyKey>();
+    var repoKey = repoDirectoryKey("repo");
+    var otherRepoKey = repoDirectoryKey("other_repo");
+    var evaluator = mock(MemoizingEvaluator.class);
+    doAnswer(
+            invocation -> {
+              Predicate<SkyKey> predicate = invocation.getArgument(0);
+              for (var key : ImmutableList.of(repoKey, otherRepoKey)) {
+                if (predicate.test(key)) {
+                  deletedKeys.add(key);
+                }
+              }
+              return null;
+            })
+        .when(evaluator)
+        .delete(ArgumentMatchers.<Predicate<SkyKey>>any());
+    overlay.beforeCommand(
+        new InMemoryCombinedCache(digestUtil),
+        mock(AbstractActionInputPrefetcher.class),
+        new Reporter(),
+        "build-request",
+        "command",
+        () -> evaluator,
+        Duration.ofMinutes(1));
+    var digest = digestUtil.compute("contents".getBytes(UTF_8));
+    IOException lostInputFailure;
+    try {
+      lostInputFailure =
+          overlay.handleLostInput(
+              externalRoot.getRelative("repo/dir/file"),
+              new CacheNotFoundException(digest, PathFragment.create("external/repo/dir/file")));
+      // Paths outside of external repos are left to rewinding.
+      assertThat(
+              overlay.handleLostInput(
+                  PathFragment.create("/output/execroot/_main/bazel-out/file"),
+                  new CacheNotFoundException(digest, PathFragment.create("bazel-out/file"))))
+          .isNull();
+    } finally {
+      overlay.afterCommand();
+    }
+
+    assertThat(lostInputFailure).isInstanceOf(DetailedIOException.class);
+    var detailedFailure = (DetailedIOException) lostInputFailure;
+    assertThat(detailedFailure)
+        .hasMessageThat()
+        .isEqualTo(
+            "external/repo/dir/file with digest %s is no longer available in the remote cache"
+                .formatted(DigestUtil.toString(digest)));
+    assertThat(detailedFailure.getTransience()).isEqualTo(Transience.TRANSIENT);
+    assertThat(
+            detailedFailure.getDetailedExitCode().getFailureDetail().getFilesystem().getCode())
+        .isEqualTo(FailureDetails.Filesystem.Code.REMOTE_FILE_EVICTED);
+    assertThat(deletedKeys).containsExactly(repoKey);
+  }
+
+  private static SkyKey repoDirectoryKey(String repoName) throws Exception {
+    var repo = RepositoryName.create(repoName);
+    return new SkyKey() {
+      @Override
+      public SkyFunctionName functionName() {
+        return SkyFunctions.REPOSITORY_DIRECTORY;
+      }
+
+      @Override
+      public Object argument() {
+        return repo;
+      }
+    };
   }
 
   @Test

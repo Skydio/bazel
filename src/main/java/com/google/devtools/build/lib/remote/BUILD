@@ -957,6 +957,7 @@ java_library(
         "//src/main/java/com/google/devtools/build/lib/events",
         "//src/main/java/com/google/devtools/build/lib/remote/common",
         "//src/main/java/com/google/devtools/build/lib/remote/common:bulk_transfer_exception",
+        "//src/main/java/com/google/devtools/build/lib/remote/common:cache_not_found_exception",
         "//src/main/java/com/google/devtools/build/lib/remote/util:bulk_transfers",
         "//src/main/java/com/google/devtools/build/lib/remote/util:digest_util",
         "//src/main/java/com/google/devtools/build/lib/remote/util:futures",
@@ -1137,7 +1138,9 @@ java_library(
     deps = [
         "//src/main/java/com/google/devtools/build/lib/cmdline",
         "//src/main/java/com/google/devtools/build/lib/events",
+        "//src/main/java/com/google/devtools/build/lib/remote/common:cache_not_found_exception",
         "//src/main/java/com/google/devtools/build/lib/vfs:pathfragment",
+        "//third_party/java/jsr305_annotations",
     ],
 )
 

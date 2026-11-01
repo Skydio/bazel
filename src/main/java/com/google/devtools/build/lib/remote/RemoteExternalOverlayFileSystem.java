@@ -40,6 +40,7 @@ import com.google.devtools.build.lib.events.Event;
 import com.google.devtools.build.lib.events.ExtendedEventHandler;
 import com.google.devtools.build.lib.events.Reporter;
 import com.google.devtools.build.lib.remote.common.BulkTransferException;
+import com.google.devtools.build.lib.remote.common.CacheNotFoundException;
 import com.google.devtools.build.lib.remote.common.RemoteActionExecutionContext;
 import com.google.devtools.build.lib.remote.util.DigestUtil;
 import com.google.devtools.build.lib.remote.util.TracingMetadataUtils;
@@ -553,10 +554,52 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem implements
       }
     }
     collectAndCreateDirectories(root, files, symlinks, new HashSet<>());
-    prefetch(files);
-    // Create symlinks last as some platforms don't allow creating a symlink to a non-existent
-    // target.
-    prefetch(symlinks);
+    try {
+      prefetch(files);
+      // Create symlinks last as some platforms don't allow creating a symlink to a non-existent
+      // target.
+      prefetch(symlinks);
+    } catch (BulkTransferException e) {
+      if (!e.allCausedByCacheNotFoundException()) {
+        throw e;
+      }
+      // Unlike during injection, the repo is already in use, so the loss can't be treated as a
+      // cache miss anymore. The prefetched files are identified by their absolute paths.
+      var lost = (CacheNotFoundException) e.getSuppressed()[0];
+      var lostPath =
+          lost.getExecPath() != null && lost.getExecPath().startsWith(externalDirectory)
+              ? lost.getExecPath()
+              : path;
+      throw lostFile(lostPath.relativeTo(externalDirectory), lost.getMissingDigest(), e);
+    }
+  }
+
+  @Override
+  @Nullable
+  public IOException handleLostInput(PathFragment path, CacheNotFoundException e) {
+    if (!path.startsWith(externalDirectory)
+        || path.segmentCount() <= externalDirectorySegmentCount) {
+      return null;
+    }
+    // Only repos retrieved from the remote repo contents cache have files whose contents aren't
+    // available locally, but the repo may no longer be served from memory, e.g. after it has been
+    // materialized concurrently. Refetching it is safe either way.
+    return lostFile(path.relativeTo(externalDirectory), e.getMissingDigest(), e);
+  }
+
+  /**
+   * Records that the remote cache has lost the file at the given path relative to the external
+   * directory, so that its repo is fetched again by the next command, and returns the exception to
+   * report the loss with.
+   */
+  private DetailedIOException lostFile(PathFragment relativePath, Digest digest, IOException e) {
+    reposWithLostFiles.add(relativePath.getSegment(0));
+    return new DetailedIOException(
+        "%s/%s with digest %s is no longer available in the remote cache"
+            .formatted(externalDirectory.getBaseName(), relativePath, DigestUtil.toString(digest)),
+        e,
+        FailureDetails.Filesystem.Code.REMOTE_FILE_EVICTED,
+        SkyFunctionException.Transience.TRANSIENT);
   }
 
   private void collectAndCreateDirectories(
@@ -980,14 +1023,7 @@ public final class RemoteExternalOverlayFileSystem extends FileSystem implements
         throw new InterruptedIOException("interrupted while waiting for remote file transfer");
       } catch (BulkTransferException e) {
         if (e.allCausedByCacheNotFoundException()) {
-          reposWithLostFiles.add(relativePath.getSegment(0));
-          throw new DetailedIOException(
-              "%s/%s with digest %s is no longer available in the remote cache"
-                  .formatted(
-                      externalDirectory.getBaseName(), relativePath, DigestUtil.toString(digest)),
-              e,
-              FailureDetails.Filesystem.Code.REMOTE_FILE_EVICTED,
-              SkyFunctionException.Transience.TRANSIENT);
+          throw lostFile(relativePath, digest, e);
         }
         throw e;
       } catch (ExecutionException e) {

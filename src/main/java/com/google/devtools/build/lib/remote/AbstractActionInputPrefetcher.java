@@ -519,6 +519,7 @@ public abstract class AbstractActionInputPrefetcher implements ActionInputPrefet
 
       @Nullable Path treeRootPath = maybeGetTreeRoot(input, metadataSupplier);
 
+      Path downloadPath = inputPath;
       Completable result =
           downloadFileNoCheckRx(
                   action,
@@ -530,7 +531,10 @@ public abstract class AbstractActionInputPrefetcher implements ActionInputPrefet
                   metadata,
                   priority,
                   reason)
-              .onErrorResumeNext(e -> Completable.error(maybeOverrideMissingInput(e, input)))
+              .onErrorResumeNext(
+                  e ->
+                      Completable.error(
+                          maybeOverrideMissingInput(e, action, input, downloadPath)))
               .andThen(plantSymlinks);
 
       return toListenableFuture(result);
@@ -702,7 +706,24 @@ public abstract class AbstractActionInputPrefetcher implements ActionInputPrefet
    * inputs such as symlinks that resolve to it, and its failure names the input of the caller that
    * started it. Returns a failure that names the given input of the current caller instead.
    */
-  private static Throwable maybeOverrideMissingInput(Throwable failure, ActionInput input) {
+  private static Throwable maybeOverrideMissingInput(
+      Throwable failure,
+      @Nullable ActionExecutionMetadata action,
+      ActionInput input,
+      Path downloadPath) {
+    // A lost file of an external repo retrieved from the remote repo contents cache is a source
+    // artifact, which rewinding can't recreate. The file system serving the repo reports the loss
+    // in a way that refetches the repo instead. This only applies to inputs of actions, as the file
+    // system itself treats lost files as cache misses while it retrieves a repo.
+    if (action != null
+        && failure instanceof CacheNotFoundException e
+        && downloadPath.getFileSystem() instanceof LazyMaterializer lazyMaterializer) {
+      IOException lostInputFailure =
+          lazyMaterializer.handleLostInput(downloadPath.asFragment(), e);
+      if (lostInputFailure != null) {
+        return lostInputFailure;
+      }
+    }
     if (failure instanceof CacheNotFoundException e
         && !input.getExecPath().equals(e.getExecPath())) {
       var ownFailure = new CacheNotFoundException(e.getMissingDigest(), input.getExecPath());
