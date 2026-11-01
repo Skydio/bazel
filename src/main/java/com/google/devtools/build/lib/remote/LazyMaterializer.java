@@ -15,8 +15,10 @@ package com.google.devtools.build.lib.remote;
 
 import com.google.devtools.build.lib.cmdline.RepositoryName;
 import com.google.devtools.build.lib.events.ExtendedEventHandler;
+import com.google.devtools.build.lib.remote.common.CacheNotFoundException;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import java.io.IOException;
+import javax.annotation.Nullable;
 
 /**
  * A file system that may keep the contents of certain directory trees in memory, backed by remote
@@ -39,4 +41,16 @@ public interface LazyMaterializer {
    * <p>Does nothing if the subtree is already backed by the local file system.
    */
   void ensureSubtreeMaterialized(PathFragment path) throws IOException, InterruptedException;
+
+  /**
+   * Returns the exception to fail an action with if the given path of one of its inputs lies in an
+   * external repository served by this file system and could not be downloaded because the remote
+   * cache has lost it, or null if the path is not in such a repository.
+   *
+   * <p>Such an input is a source artifact, which action rewinding can't recreate. Instead, the
+   * repository is fetched again by the next command, and the returned exception reports the loss as
+   * a transient remote cache eviction.
+   */
+  @Nullable
+  IOException handleLostInput(PathFragment path, CacheNotFoundException e);
 }

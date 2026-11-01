@@ -275,5 +275,126 @@ class RemoteRepoContentsCacheRewindingTest(
     )
 
 
+  def _setupLocalActionWithRepoInput(self, src, cmd):
+    self.ScratchFile(
+        'MODULE.bazel',
+        [
+            'repo = use_repo_rule("//:repo.bzl", "repo")',
+            'repo(name = "my_repo")',
+        ],
+    )
+    self.ScratchFile('BUILD.bazel')
+    self.ScratchFile(
+        'repo.bzl',
+        [
+            'def _repo_impl(rctx):',
+            '  rctx.file("BUILD", "exports_files([\'data.txt\', \'dir\'])")',
+            '  rctx.file("data.txt", "hello")',
+            '  rctx.file("dir/file.txt", "in dir")',
+            '  print("JUST FETCHED")',
+            '  return rctx.repo_metadata(reproducible=True)',
+            'repo = repository_rule(_repo_impl)',
+        ],
+    )
+    self.ScratchFile(
+        'main/BUILD.bazel',
+        [
+            'genrule(',
+            '  name = "use_data",',
+            '  srcs = [%s],' % json.dumps(src),
+            '  outs = ["out.txt"],',
+            '  cmd = %s,' % json.dumps(cmd),
+            # The action must run locally to consume its inputs.
+            '  tags = ["no-remote-cache"],',
+            ')',
+        ],
+    )
+    repo_dir = self.RepoDir('my_repo')
+    args = ['build', '//main:use_data', '--rewind_lost_inputs']
+    self.RunBazel(args + ['--nobuild'])
+    self.RunBazel(['clean', '--expunge'])
+    _, _, stderr = self.RunBazel(args + ['--nobuild'])
+    self.assertNotIn('JUST FETCHED', '\n'.join(stderr))
+    self.assertFalse(os.path.exists(os.path.join(repo_dir, 'data.txt')))
+    return repo_dir, args
+
+  def testLostRemoteFile_localActionInput(self):
+    # Regression test for a crash when a file in a remotely cached repo has
+    # been evicted after the analysis phase and this is only noticed while
+    # prefetching the inputs of a locally executed action. Rewinding can't
+    # recreate the lost file as it is a source artifact, so the command fails
+    # with a transient error and the next one fetches the repo again.
+    repo_dir, args = self._setupLocalActionWithRepoInput(
+        '@my_repo//:data.txt', 'cat $< > $@'
+    )
+    canonical_repo_name = repo_dir[repo_dir.rfind('/') + 1 :]
+
+    # Analysis is warm, so the eviction is only noticed while prefetching the
+    # inputs of the action.
+    self.DeleteCasEntry(b'hello')
+    exit_code, _, stderr = self.RunBazel(
+        args + ['--experimental_remote_cache_eviction_retries=0'],
+        allow_failure=True,
+    )
+    self.AssertExitCode(exit_code, 39, stderr)
+    stderr = '\n'.join(stderr)
+    self.assertNotIn('Unexpected source artifact', stderr)
+    self.assertIn(
+        'external/%s/data.txt with digest %s/5 is no longer available in the'
+        ' remote cache'
+        % (canonical_repo_name, hashlib.sha256(b'hello').hexdigest()),
+        stderr,
+    )
+
+    # The next build fetches the repo again.
+    _, _, stderr = self.RunBazel(args)
+    self.assertIn('JUST FETCHED', '\n'.join(stderr))
+    self.assertTrue(os.path.exists(os.path.join(repo_dir, 'data.txt')))
+
+  def testLostRemoteFile_localActionInput_retried(self):
+    # Same as above, but the command recovers by retrying itself.
+    repo_dir, args = self._setupLocalActionWithRepoInput(
+        '@my_repo//:data.txt', 'cat $< > $@'
+    )
+
+    self.DeleteCasEntry(b'hello')
+    _, _, stderr = self.RunBazel(
+        args + ['--experimental_remote_cache_eviction_retries=1']
+    )
+    stderr = '\n'.join(stderr)
+    self.assertIn(
+        'Found transient remote cache error, retrying the build...', stderr
+    )
+    self.assertIn('JUST FETCHED', stderr)
+    self.assertTrue(os.path.exists(os.path.join(repo_dir, 'data.txt')))
+
+  def testLostRemoteFile_localActionSourceDirectoryInput(self):
+    # A source directory input is materialized as a whole before the action
+    # runs locally.
+    repo_dir, args = self._setupLocalActionWithRepoInput(
+        '@my_repo//:dir', 'cat $</file.txt > $@'
+    )
+    canonical_repo_name = repo_dir[repo_dir.rfind('/') + 1 :]
+
+    self.DeleteCasEntry(b'in dir')
+    exit_code, _, stderr = self.RunBazel(
+        args + ['--experimental_remote_cache_eviction_retries=0'],
+        allow_failure=True,
+    )
+    self.AssertExitCode(exit_code, 39, stderr)
+    stderr = '\n'.join(stderr)
+    self.assertIn(
+        'external/%s/dir/file.txt with digest %s/6 is no longer available in'
+        ' the remote cache'
+        % (canonical_repo_name, hashlib.sha256(b'in dir').hexdigest()),
+        stderr,
+    )
+
+    # The next build fetches the repo again.
+    _, _, stderr = self.RunBazel(args)
+    self.assertIn('JUST FETCHED', '\n'.join(stderr))
+    self.assertTrue(os.path.exists(os.path.join(repo_dir, 'dir/file.txt')))
+
+
 if __name__ == '__main__':
   absltest.main()
