@@ -24,6 +24,7 @@ import com.google.devtools.build.lib.analysis.util.AnalysisMock;
 import com.google.devtools.build.lib.analysis.util.BuildViewTestCase;
 import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.rules.repository.RepositoryDirectoryValue;
+import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.skyframe.EvaluationContext;
 import com.google.devtools.build.skyframe.SkyFunction;
 import com.google.devtools.build.skyframe.SkyFunctionName;
@@ -512,6 +513,23 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
     var result = getSkyframeExecutor().prepareAndGet(ImmutableSet.of(key), context);
     assertThat(result.getError(key)).isNull();
     return ImmutableList.copyOf(((DirectTargetHashFunction.Value) result.get(key)).getDeps());
+  }
+
+  @Test
+  public void externalRepoHash_isRecordedUnderTheOutputBase() throws Exception {
+    var unused = extHashes();
+
+    var records =
+        directories
+            .getOutputBase()
+            .getRelative(RepoContentDigestFunction.HASH_MARKERS_DIR)
+            .getDirectoryEntries();
+    var ext = records.stream().filter(p -> p.getBaseName().endsWith("+ext")).findFirst();
+    assertThat(ext).isPresent();
+    assertThat(
+            new String(
+                FileSystemUtils.readContentAsLatin1(ext.get())))
+        .startsWith("marker fetched\n");
   }
 
   @Test

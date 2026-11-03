@@ -68,6 +68,9 @@ public final class RepoContentDigestFunction implements SkyFunction {
   private static final RepoRuleId NEW_LOCAL_REPOSITORY =
       new RepoRuleId(LocalPathRepoSpecs.LOCAL_REPOSITORY.bzlFileLabel(), "new_local_repository");
 
+  /** Under the output base, where {@link #record} writes how each repo was hashed. */
+  public static final String HASH_MARKERS_DIR = "hash_markers";
+
   private final BlazeDirectories directories;
 
   public RepoContentDigestFunction(BlazeDirectories directories) {
@@ -144,29 +147,53 @@ public final class RepoContentDigestFunction implements SkyFunction {
     if (definition == null) {
       return null;
     }
-    if (!(definition instanceof RepoDefinitionValue.Found(RepoDefinition repoDefinition))
-        || isInWorkspace(repoDefinition)) {
-      return Value.USE_FILE_DIGESTS;
+    if (!(definition instanceof RepoDefinitionValue.Found(RepoDefinition repoDefinition))) {
+      return record(repo, "files overridden", Value.USE_FILE_DIGESTS);
+    }
+    if (isInWorkspace(repoDefinition)) {
+      return record(repo, "files in workspace", Value.USE_FILE_DIGESTS);
     }
     var directory = (RepositoryDirectoryValue) env.getValue(RepositoryDirectoryValue.key(repo));
     if (directory == null) {
       return null;
     }
     if (!(directory instanceof RepositoryDirectoryValue.Success success)) {
-      return Value.USE_FILE_DIGESTS;
+      return record(repo, "files no repository", Value.USE_FILE_DIGESTS);
     }
     Path externalRoot =
         directories.getOutputBase().getRelative(LabelConstants.EXTERNAL_REPOSITORY_LOCATION);
-    String marker;
+    Marker marker;
     try {
       marker = marker(repo, success.root().asPath(), externalRoot);
     } catch (IOException e) {
       throw new RepoContentDigestFunctionException(e);
     }
     if (marker == null) {
-      return Value.USE_FILE_DIGESTS;
+      return record(repo, "files no marker", Value.USE_FILE_DIGESTS);
     }
-    return new Value(new Fingerprint().addString("<marker>").addString(marker).digestAndReset());
+    return record(
+        repo,
+        "marker " + marker.source() + "\n" + marker.contents(),
+        new Value(
+            new Fingerprint().addString("<marker>").addString(marker.contents()).digestAndReset()));
+  }
+
+  /** A repo's marker file contents and where they were read from. */
+  private record Marker(String source, String contents) {}
+
+  /**
+   * Writes how {@code repo} was hashed to {@code <output_base>/hash_markers/@<repo>}, so that two
+   * machines' hashes can be compared repo by repo. Best-effort: a failure to write is ignored.
+   */
+  private Value record(RepositoryName repo, String how, Value value) {
+    Path dir = directories.getOutputBase().getRelative(HASH_MARKERS_DIR);
+    try {
+      dir.createDirectoryAndParents();
+      FileSystemUtils.writeContentAsLatin1(dir.getChild("@" + repo.getName()), how + "\n");
+    } catch (IOException e) {
+      // Only a debugging aid.
+    }
+    return value;
   }
 
   /**
@@ -187,15 +214,14 @@ public final class RepoContentDigestFunction implements SkyFunction {
     return dir.startsWith(workspace) && !dir.startsWith(directories.getOutputBase());
   }
 
-  /** Returns the contents of the marker file of {@code repo}, or null if it has none. */
+  /** Returns the marker file of {@code repo}, or null if it has none. */
   @Nullable
-  private static String marker(RepositoryName repo, Path root, Path externalRoot)
+  private static Marker marker(RepositoryName repo, Path root, Path externalRoot)
       throws IOException {
     if (root.getFileSystem() instanceof InMemoryRepoMarkerFiles inMemory) {
       String marker = inMemory.getInMemoryMarkerFileContents(repo.getName());
       if (marker != null) {
-        // Served from the remote repo contents cache.
-        return marker;
+        return new Marker("remote_repo_contents_cache", marker);
       }
     }
     FileStatus status = root.statIfFound(Symlinks.NOFOLLOW);
@@ -211,11 +237,11 @@ public final class RepoContentDigestFunction implements SkyFunction {
               .getParentDirectory()
               .getChild(entry.getBaseName() + LocalRepoContentsCache.RECORDED_INPUTS_SUFFIX);
       if (recordedInputs.isFile()) {
-        return readLatin1(recordedInputs);
+        return new Marker("local_repo_contents_cache", readLatin1(recordedInputs));
       }
     }
     Path marker = externalRoot.getChild(repo.getMarkerFileName());
-    return marker.isFile() ? readLatin1(marker) : null;
+    return marker.isFile() ? new Marker("fetched", readLatin1(marker)) : null;
   }
 
   private static String readLatin1(Path path) throws IOException {
