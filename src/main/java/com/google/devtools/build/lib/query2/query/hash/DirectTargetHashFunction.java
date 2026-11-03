@@ -270,8 +270,9 @@ public final class DirectTargetHashFunction implements SkyFunction {
     }
     deps.remove(label);
 
-    // Source files of external repos that only change when refetched are hashed by the digest of
-    // the whole repo, rather than tracking each file in Skyframe.
+    // Source files of external repos are covered by the digest of the whole repo, its marker,
+    // rather than tracking each file in Skyframe; see RepoContentDigestFunction for the
+    // exceptions.
     RepoContentDigestFunction.Value repoDigest = null;
     if (!label.getRepository().isMain()
         && (target instanceof InputFile || target instanceof Rule)) {

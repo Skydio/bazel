@@ -14,7 +14,6 @@
 package com.google.devtools.build.lib.query2.query.hash;
 
 import static com.google.common.truth.Truth.assertThat;
-import static java.nio.charset.StandardCharsets.ISO_8859_1;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -25,8 +24,6 @@ import com.google.devtools.build.lib.analysis.util.AnalysisMock;
 import com.google.devtools.build.lib.analysis.util.BuildViewTestCase;
 import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.rules.repository.RepositoryDirectoryValue;
-import com.google.devtools.build.lib.vfs.FileSystemUtils;
-import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.skyframe.EvaluationContext;
 import com.google.devtools.build.skyframe.SkyFunction;
 import com.google.devtools.build.skyframe.SkyFunctionName;
@@ -299,13 +296,13 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
   }
 
   @Test
-  public void externalRepoRefetchedWithSameContents_doesNotAffectDependents() throws Exception {
+  public void externalRepoRefetchedWithSameContents_affectsDependents() throws Exception {
     ImmutableMap<Label, String> before = extHashes();
 
-    // The repo definition changes, so the repo is refetched, but its files are identical.
+    // The marker changes with the definition even though the repo's files are identical.
     writeModuleFile(/* content= */ "a", /* unused= */ "2");
 
-    assertThat(extHashes()).isEqualTo(before);
+    assertThat(extHashes()).isNotEqualTo(before);
   }
 
   @Test
@@ -323,7 +320,7 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
     assertThat(result.getError(filesKey)).isNull();
     var filesValue = (DirectTargetHashFunction.Value) result.get(filesKey);
 
-    // a.txt and b.txt are covered by the digest of the whole repo.
+    // a.txt and b.txt are covered by the repo's marker.
     assertThat(filesValue.getDeps()).isEmpty();
   }
 
@@ -377,11 +374,10 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
   }
 
   @Test
-  public void externalRepoSymlinkIntoWorkspace_isHashedByTargetContents() throws Exception {
+  public void externalRepoWatchedFileChange_affectsDependents() throws Exception {
     ImmutableMap<Label, String> before = extHashes();
 
-    // @ext symlinks to //tc:linked.txt with an absolute path, which stays the same when the file
-    // changes.
+    // @ext watches //tc:linked.txt, so its marker records the file's contents.
     scratch.overwriteFile("tc/linked.txt", "changed linked");
     invalidatePackages();
 
@@ -439,6 +435,7 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
     assertThat(changed(before, executable)).containsExactly("//app:unrelated");
     assertThat(hashes()).isEqualTo(before);
   }
+
   /** Drops every computed hash, as a new server would start without them. */
   private void dropHashValues() {
     getSkyframeExecutor()
@@ -450,30 +447,22 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
                     || key.functionName().equals(DirectTargetHashFunction.NAME));
   }
 
-  private ImmutableList<Path> persistedDigestFiles() throws Exception {
-    Path external = directories.getOutputBase().getRelative("external");
-    return external.getDirectoryEntries().stream()
-        .filter(path -> path.getBaseName().endsWith(".content_digest"))
-        .collect(ImmutableList.toImmutableList());
-  }
-
-  private Path onlyPersistedDigestFile() throws Exception {
-    return Iterables.getOnlyElement(persistedDigestFiles());
+  /** Returns the source files the hash of {@code label} lists as dependencies. */
+  private ImmutableList<Label> directDeps(Label label) throws Exception {
+    EvaluationContext context =
+        EvaluationContext.newBuilder().setParallelism(1).setEventHandler(reporter).build();
+    var key = DirectTargetHashFunction.key(label);
+    var result = getSkyframeExecutor().prepareAndGet(ImmutableSet.of(key), context);
+    assertThat(result.getError(key)).isNull();
+    return ImmutableList.copyOf(((DirectTargetHashFunction.Value) result.get(key)).getDeps());
   }
 
   @Test
-  public void externalRepoDigest_isReadBackAfterHashValuesAreDropped() throws Exception {
+  public void externalRepoHash_isUnchangedAfterHashValuesAreDropped() throws Exception {
     ImmutableMap<Label, String> before = extHashes();
-    Path digestFile = onlyPersistedDigestFile();
-    String identity = FileSystemUtils.readContent(digestFile, ISO_8859_1).split(" ")[0];
 
-    // A new server must use the persisted digest instead of reading the repo's files again.
-    FileSystemUtils.writeContent(digestFile, ISO_8859_1, identity + " " + "00".repeat(32) + "\n");
     dropHashValues();
-    assertThat(extHashes()).isNotEqualTo(before);
 
-    digestFile.delete();
-    dropHashValues();
     assertThat(extHashes()).isEqualTo(before);
   }
 
@@ -488,33 +477,24 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
   }
 
   @Test
-  public void externalRepoRefetchedWithSameContentsAfterHashValuesAreDropped_doesNotAffectDependents()
-      throws Exception {
-    ImmutableMap<Label, String> before = extHashes();
-    dropHashValues();
-
-    writeModuleFile(/* content= */ "a", /* unused= */ "2");
-
-    assertThat(extHashes()).isEqualTo(before);
-  }
-
-  @Test
-  public void corruptPersistedDigest_isComputedAgain() throws Exception {
+  public void externalRepoHash_doesNotDependOnWhetherTheFetchIsReproducible() throws Exception {
     ImmutableMap<Label, String> before = extHashes();
 
-    FileSystemUtils.writeContent(onlyPersistedDigestFile(), ISO_8859_1, "not a digest");
-    dropHashValues();
+    writeReproducibleModuleFile(/* content= */ "changed", /* unused= */ "1");
+    ImmutableMap<Label, String> reproducible = extHashes();
+    writeModuleFile(/* content= */ "changed", /* unused= */ "1");
 
-    assertThat(extHashes()).isEqualTo(before);
+    // Both fetches are hashed by their marker, so a change reaches dependents either way.
+    assertThat(reproducible).isNotEqualTo(before);
+    assertThat(extHashes()).isNotEqualTo(before);
   }
 
-  @Test
-  public void localRepo_isHashedPerFileAndNeverPersisted() throws Exception {
+  private void writeLocalContentRepo(String content) throws Exception {
     rewriteModuleDotBazel(
         "register_toolchains('//tc:all')",
         "local_content_repo = use_repo_rule('//defs:repos.bzl', 'local_content_repo')",
-        "local_content_repo(name = 'local_ext', content = 'a')");
-    scratch.file(
+        String.format("local_content_repo(name = 'local_ext', content = '%s')", content));
+    scratch.overwriteFile(
         "local_user/BUILD",
         """
         filegroup(
@@ -522,87 +502,69 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
             srcs = ["@local_ext//:files"],
         )
         """);
-    Label user = Label.parseCanonical("//local_user:uses_local");
+  }
 
+  @Test
+  public void localRepoRule_isHashedByItsMarker() throws Exception {
+    writeLocalContentRepo(/* content= */ "a");
+    Label user = Label.parseCanonical("//local_user:uses_local");
     ImmutableMap<Label, String> before = hashes(user);
 
-    assertThat(persistedDigestFiles()).isEmpty();
-    rewriteModuleDotBazel(
-        "register_toolchains('//tc:all')",
-        "local_content_repo = use_repo_rule('//defs:repos.bzl', 'local_content_repo')",
-        "local_content_repo(name = 'local_ext', content = 'changed')");
+    // The repo's files are not hashed one by one: its marker covers them.
+    assertThat(directDeps(Iterables.getOnlyElement(directDeps(user)))).isEmpty();
+    writeLocalContentRepo(/* content= */ "changed");
     assertThat(hashes(user)).isNotEqualTo(before);
   }
 
-  private ImmutableList<Path> reproducibleFiles() throws Exception {
-    Path external = directories.getOutputBase().getRelative("external");
-    return external.getDirectoryEntries().stream()
-        .filter(path -> path.getBaseName().endsWith(".reproducible"))
-        .collect(ImmutableList.toImmutableList());
+  private void writeLocalRepository(String path) throws Exception {
+    rewriteModuleDotBazel(
+        "register_toolchains('//tc:all')",
+        "local_repository = use_repo_rule('@bazel_tools//tools/build_defs/repo:local.bzl',"
+            + " 'local_repository')",
+        String.format("local_repository(name = 'vendored', path = '%s')", path));
+    scratch.overwriteFile(
+        "vendored_user/BUILD",
+        """
+        filegroup(
+            name = "uses_vendored",
+            srcs = ["@vendored//:files"],
+        )
+        """);
+  }
+
+  private void writeVendoredFiles(String dir, String content) throws Exception {
+    scratch.overwriteFile(dir + "/REPO.bazel");
+    scratch.overwriteFile(
+        dir + "/BUILD",
+        "filegroup(name = 'files', srcs = ['a.txt'], visibility = ['//visibility:public'])");
+    scratch.overwriteFile(dir + "/a.txt", content);
   }
 
   @Test
-  public void reproducibleRepo_isHashedByItsMarkerWithoutAContentDigest() throws Exception {
-    writeReproducibleModuleFile(/* content= */ "a", /* unused= */ "1");
+  public void localRepositoryInWorkspace_isHashedPerFile() throws Exception {
+    writeVendoredFiles("third_party/vendored", "a");
+    writeLocalRepository("third_party/vendored");
+    Label user = Label.parseCanonical("//vendored_user:uses_vendored");
+    ImmutableMap<Label, String> before = hashes(user);
 
-    ImmutableMap<Label, String> hashes = extHashes();
-
-    assertThat(hashes).isNotEmpty();
-    assertThat(reproducibleFiles()).hasSize(1);
-    assertThat(persistedDigestFiles()).isEmpty();
-  }
-
-  @Test
-  public void reproducibleRepoContentChange_affectsDependents() throws Exception {
-    writeReproducibleModuleFile(/* content= */ "a", /* unused= */ "1");
-    ImmutableMap<Label, String> before = extHashes();
-
-    writeReproducibleModuleFile(/* content= */ "changed", /* unused= */ "1");
-
-    assertThat(extHashes()).isNotEqualTo(before);
-  }
-
-  @Test
-  public void reproducibleRepoRefetchedWithSameContents_affectsDependents() throws Exception {
-    writeReproducibleModuleFile(/* content= */ "a", /* unused= */ "1");
-    ImmutableMap<Label, String> before = extHashes();
-
-    // The marker changes with the definition even though the repo's files are identical.
-    writeReproducibleModuleFile(/* content= */ "a", /* unused= */ "2");
-
-    assertThat(extHashes()).isNotEqualTo(before);
-  }
-
-  @Test
-  public void reproducibleRepoWatchedFileChange_affectsDependents() throws Exception {
-    writeReproducibleModuleFile(/* content= */ "a", /* unused= */ "1");
-    ImmutableMap<Label, String> before = extHashes();
-
-    scratch.overwriteFile("tc/linked.txt", "relinked");
+    scratch.overwriteFile("third_party/vendored/a.txt", "changed");
     invalidatePackages();
 
-    assertThat(extHashes()).isNotEqualTo(before);
+    assertThat(hashes(user)).isNotEqualTo(before);
   }
 
   @Test
-  public void reproducibleRepoHash_isUnchangedAfterHashValuesAreDropped() throws Exception {
-    writeReproducibleModuleFile(/* content= */ "a", /* unused= */ "1");
-    ImmutableMap<Label, String> before = extHashes();
+  public void localRepositoryOutsideWorkspace_isHashedByItsMarker() throws Exception {
+    writeVendoredFiles("/outside/vendored", "a");
+    writeLocalRepository("/outside/vendored");
+    Label user = Label.parseCanonical("//vendored_user:uses_vendored");
+    ImmutableMap<Label, String> before = hashes(user);
 
-    dropHashValues();
+    // The marker does not record the contents of files outside the workspace that the repo rule
+    // does not watch.
+    scratch.overwriteFile("/outside/vendored/a.txt", "changed");
+    invalidatePackages();
 
-    assertThat(extHashes()).isEqualTo(before);
-  }
-
-  @Test
-  public void repoNoLongerReproducible_isHashedByItsContents() throws Exception {
-    writeReproducibleModuleFile(/* content= */ "a", /* unused= */ "1");
-    var unused = extHashes();
-
-    writeModuleFile(/* content= */ "a", /* unused= */ "1");
-    var unused2 = extHashes();
-
-    assertThat(reproducibleFiles()).isEmpty();
-    assertThat(persistedDigestFiles()).hasSize(1);
+    assertThat(hashes(user)).isEqualTo(before);
   }
 }
