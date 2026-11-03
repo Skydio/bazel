@@ -48,7 +48,9 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
             .put(DirectTargetHashFunction.NAME, new DirectTargetHashFunction(directories))
             .put(SourceFileDigestFunction.NAME, new SourceFileDigestFunction())
             .put(RepoContentDigestFunction.NAME, new RepoContentDigestFunction(directories))
-            .put(RegisteredToolchainsByTypeFunction.NAME, new RegisteredToolchainsByTypeFunction())
+            .put(
+                RegisteredToolchainsByTypeFunction.NAME,
+                new RegisteredToolchainsByTypeFunction(directories))
             .buildOrThrow();
       }
     };

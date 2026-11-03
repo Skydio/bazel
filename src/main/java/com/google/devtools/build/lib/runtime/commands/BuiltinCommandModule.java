@@ -67,6 +67,7 @@ public class BuiltinCommandModule extends BlazeModule {
         .addSkyFunction(SourceFileDigestFunction.NAME, new SourceFileDigestFunction())
         .addSkyFunction(RepoContentDigestFunction.NAME, new RepoContentDigestFunction(directories))
         .addSkyFunction(
-            RegisteredToolchainsByTypeFunction.NAME, new RegisteredToolchainsByTypeFunction());
+            RegisteredToolchainsByTypeFunction.NAME,
+            new RegisteredToolchainsByTypeFunction(directories));
   }
 }

@@ -19,6 +19,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ImmutableSetMultimap;
 import com.google.common.collect.Ordering;
+import com.google.devtools.build.lib.analysis.BlazeDirectories;
 import com.google.devtools.build.lib.bazel.bzlmod.BazelDepGraphValue;
 import com.google.devtools.build.lib.bazel.bzlmod.Module;
 import com.google.devtools.build.lib.cmdline.Label;
@@ -38,6 +39,8 @@ import com.google.devtools.build.lib.skyframe.PackageValue;
 import com.google.devtools.build.lib.skyframe.RepositoryMappingValue;
 import com.google.devtools.build.lib.skyframe.TargetPatternUtil;
 import com.google.devtools.build.lib.skyframe.TargetPatternUtil.InvalidTargetPatternException;
+import com.google.devtools.build.lib.vfs.FileSystemUtils;
+import com.google.devtools.build.lib.vfs.Path;
 import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.skyframe.SkyFunction;
 import com.google.devtools.build.skyframe.SkyFunctionException;
@@ -45,6 +48,7 @@ import com.google.devtools.build.skyframe.SkyFunctionName;
 import com.google.devtools.build.skyframe.SkyKey;
 import com.google.devtools.build.skyframe.SkyValue;
 import com.google.devtools.build.skyframe.SkyframeLookupResult;
+import java.io.IOException;
 import java.util.List;
 import javax.annotation.Nullable;
 
@@ -64,6 +68,12 @@ import javax.annotation.Nullable;
  * configuration.
  */
 public final class RegisteredToolchainsByTypeFunction implements SkyFunction {
+  private final BlazeDirectories directories;
+
+  public RegisteredToolchainsByTypeFunction(BlazeDirectories directories) {
+    this.directories = directories;
+  }
+
   public static final SkyFunctionName NAME =
       SkyFunctionName.createHermetic("QUERY_REGISTERED_TOOLCHAINS_BY_TYPE");
 
@@ -163,7 +173,9 @@ public final class RegisteredToolchainsByTypeFunction implements SkyFunction {
         toolchainsByType.put(toolchainType, toolchain);
       }
     }
-    return new Value(toolchainsByType.build());
+    ImmutableSetMultimap<Label, Label> result = toolchainsByType.build();
+    record(result);
+    return new Value(result);
   }
 
   /**
@@ -203,6 +215,28 @@ public final class RegisteredToolchainsByTypeFunction implements SkyFunction {
       }
     }
     return env.valuesMissing() ? null : patterns.build();
+  }
+
+  /**
+   * Writes each toolchain type and the toolchains registered for it to {@code
+   * <output_base>/hash_markers/_registered_toolchains}, so that two machines' hashes can be
+   * compared. Best-effort: a failure to write is ignored.
+   */
+  private void record(ImmutableSetMultimap<Label, Label> toolchainsByType) {
+    StringBuilder out = new StringBuilder();
+    for (Label type : toolchainsByType.keySet()) {
+      out.append(type).append('\n');
+      for (Label toolchain : toolchainsByType.get(type)) {
+        out.append("  ").append(toolchain).append('\n');
+      }
+    }
+    Path dir = directories.getOutputBase().getRelative(RepoContentDigestFunction.HASH_MARKERS_DIR);
+    try {
+      dir.createDirectoryAndParents();
+      FileSystemUtils.writeContentAsLatin1(dir.getChild("_registered_toolchains"), out.toString());
+    } catch (IOException e) {
+      // Only a debugging aid.
+    }
   }
 
   private static final class RegisteredToolchainsByTypeFunctionException
