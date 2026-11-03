@@ -13,10 +13,9 @@
 // limitations under the License.
 package com.google.devtools.build.lib.query2.query.hash;
 
-import com.google.common.collect.ImmutableList;
-import com.google.common.io.BaseEncoding;
 import com.google.devtools.build.lib.analysis.BlazeDirectories;
-import com.google.devtools.build.lib.bazel.repository.DigestWriter;
+import com.google.devtools.build.lib.bazel.bzlmod.LocalPathRepoSpecs;
+import com.google.devtools.build.lib.bazel.bzlmod.RepoRuleId;
 import com.google.devtools.build.lib.bazel.repository.RepoDefinition;
 import com.google.devtools.build.lib.bazel.repository.RepoDefinitionValue;
 import com.google.devtools.build.lib.bazel.repository.cache.LocalRepoContentsCache;
@@ -24,12 +23,10 @@ import com.google.devtools.build.lib.cmdline.LabelConstants;
 import com.google.devtools.build.lib.cmdline.RepositoryName;
 import com.google.devtools.build.lib.rules.repository.RepositoryDirectoryValue;
 import com.google.devtools.build.lib.util.Fingerprint;
-import com.google.devtools.build.lib.vfs.Dirent;
 import com.google.devtools.build.lib.vfs.FileStatus;
 import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.lib.vfs.InMemoryRepoMarkerFiles;
 import com.google.devtools.build.lib.vfs.Path;
-import com.google.devtools.build.lib.vfs.PathFragment;
 import com.google.devtools.build.lib.vfs.Symlinks;
 import com.google.devtools.build.skyframe.AbstractSkyKey;
 import com.google.devtools.build.skyframe.SkyFunction;
@@ -38,56 +35,38 @@ import com.google.devtools.build.skyframe.SkyFunctionName;
 import com.google.devtools.build.skyframe.SkyKey;
 import com.google.devtools.build.skyframe.SkyValue;
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Comparator;
-import java.util.List;
 import javax.annotation.Nullable;
 
 /**
  * Computes a single digest of an external repository, for {@code --generate_hashes}.
  *
- * <p>The contents of a repo fetched by a repo rule that is neither {@code local} nor {@code
- * configure} only change when Bazel refetches it, and a refetch invalidates the repo's {@link
- * RepositoryDirectoryValue}. Such a repo can therefore be hashed as one unit instead of tracking
- * each of its files in Skyframe. That matters for toolchain repos with hundreds of thousands of
- * files, which Bazel would otherwise check for changes on every command. Edits made by hand inside
- * such a repo are not seen.
+ * <p>An external repo is hashed by its marker file, which records the predeclared inputs of its
+ * repo rule (Bazel version, flags, repo rule definition and attributes) and the values of every
+ * input it read: watched files, directory listings and environment variables. Its files are not
+ * read. The marker is the same whether the repo was fetched into the external directory, is served
+ * from the local repo contents cache (as the entry's recorded inputs) or from the remote one (held
+ * in memory), so all three hash the same, and two machines that fetch a repo from the same inputs
+ * hash it the same even when the files they produce differ.
  *
- * <p>A repo whose contents came from a reproducible fetch is hashed by its marker file, which
- * records the predeclared inputs of its repo rule (Bazel version, flags, repo rule definition and
- * attributes) and the values of every input it read. Reproducibility means that the marker
- * determines the contents, which is what the local and remote repo contents caches rely on too, so
- * the repo's files are not read at all. The marker is the same whether the repo was fetched, is
- * served from the local repo contents cache (as the entry's recorded inputs) or from the remote one
- * (held in memory), so all three hash the same. Unlike a content digest, this changes the hash when
- * the repo's inputs change but its files come out the same.
+ * <p>That holds for {@code local} and {@code configure} repos and for repos whose fetch is not
+ * reproducible too. What their marker does not record is not part of the hash: a host file a repo
+ * rule symlinks without watching it, or the bytes of a download it does not pin. A repo rule that
+ * wants such an input to change the hash must watch it, or read a checked-in file that pins it.
  *
- * <p>Other repos are hashed by their contents, read once per fetch with direct filesystem calls.
- * The executable bit of files is not part of that digest. Repo rules often create absolute
- * symlinks into the output base or the workspace, and Bazel only makes them relative for
- * reproducible repos. To keep the digest independent of where the output base and the workspace
- * are, absolute symlink targets under them are hashed relative to them. Symlinks into the workspace
- * are also hashed by the contents of the files they point to: Bazel refetches the repo when such a
- * file changes (if the repo rule watches it), but the symlink itself stays the same.
- *
- * <p>The content digest is persisted next to the repo's marker file, as {@code
- * @<repo>.content_digest}, keyed by an identity of the fetch that includes the marker. A new server
- * reads it back instead of the repo's files, as long as the repo has not been refetched since.
- *
- * <p>For other repos (the main repo, {@code local} and {@code configure} repos, and overridden
- * repos), {@link Value#usesFileDigests} is true and source files are hashed individually by {@link
- * SourceFileDigestFunction}. Their digests are never persisted.
+ * <p>For the main repo, overridden repos and {@code local_repository} or {@code
+ * new_local_repository} repos whose path is in the workspace, {@link Value#usesFileDigests} is true
+ * and source files are hashed individually by {@link SourceFileDigestFunction}: those are files
+ * people edit, and their marker does not record their contents. So is any other repo whose marker
+ * cannot be found.
  */
 public final class RepoContentDigestFunction implements SkyFunction {
-  // Not hermetic: the repo's files are read directly instead of through Skyframe.
+  // Not hermetic: the marker is read directly instead of through Skyframe.
   public static final SkyFunctionName NAME =
       SkyFunctionName.createNonHermetic("QUERY_REPO_CONTENT_DIGEST");
 
-  private static final String DIGEST_FILE_SUFFIX = ".content_digest";
-
-  // Changing what a digest or a fetch identity covers requires a new format.
-  private static final String DIGEST_FILE_FORMAT = "1";
+  private static final RepoRuleId NEW_LOCAL_REPOSITORY =
+      new RepoRuleId(LocalPathRepoSpecs.LOCAL_REPOSITORY.bzlFileLabel(), "new_local_repository");
 
   private final BlazeDirectories directories;
 
@@ -122,7 +101,7 @@ public final class RepoContentDigestFunction implements SkyFunction {
     }
   }
 
-  /** The digest of a repo's contents, or null if its files must be hashed individually. */
+  /** The digest of a repo, or null if its files must be hashed individually. */
   public static final class Value implements SkyValue {
     static final Value USE_FILE_DIGESTS = new Value(null);
 
@@ -136,7 +115,7 @@ public final class RepoContentDigestFunction implements SkyFunction {
       return digest == null;
     }
 
-    /** The digest of the repo's contents, or null if {@link #usesFileDigests} is true. */
+    /** The digest of the repo, or null if {@link #usesFileDigests} is true. */
     @Nullable
     public byte[] getDigest() {
       return digest;
@@ -166,9 +145,7 @@ public final class RepoContentDigestFunction implements SkyFunction {
       return null;
     }
     if (!(definition instanceof RepoDefinitionValue.Found(RepoDefinition repoDefinition))
-        || repoDefinition.repoRule().local()
-        || repoDefinition.repoRule().configure()) {
-      // Overridden, local and configure repos can change without a refetch.
+        || isInWorkspace(repoDefinition)) {
       return Value.USE_FILE_DIGESTS;
     }
     var directory = (RepositoryDirectoryValue) env.getValue(RepositoryDirectoryValue.key(repo));
@@ -178,209 +155,71 @@ public final class RepoContentDigestFunction implements SkyFunction {
     if (!(directory instanceof RepositoryDirectoryValue.Success success)) {
       return Value.USE_FILE_DIGESTS;
     }
-    Path root = success.root().asPath();
     Path externalRoot =
         directories.getOutputBase().getRelative(LabelConstants.EXTERNAL_REPOSITORY_LOCATION);
-    @Nullable String marker = reproducibleMarker(repo, root, externalRoot);
-    if (marker != null) {
-      return new Value(
-          new Fingerprint().addString("<marker>").addString(marker).digestAndReset());
-    }
-    Path digestFile = externalRoot.getChild("@" + repo.getName() + DIGEST_FILE_SUFFIX);
-    @Nullable String fetchIdentity = fetchIdentity(repo, root, externalRoot);
-    if (fetchIdentity != null) {
-      byte[] persisted = readPersistedDigest(digestFile, fetchIdentity);
-      if (persisted != null) {
-        return new Value(persisted);
-      }
-    }
-    Fingerprint fp = new Fingerprint();
+    String marker;
     try {
-      // Most specific first. The repo root may itself be a symlink into the repo contents cache.
-      ImmutableList<SymlinkBase> bases =
-          ImmutableList.of(
-              new SymlinkBase(root.asFragment(), "<repo>"),
-              new SymlinkBase(root.resolveSymbolicLinks().asFragment(), "<repo>"),
-              new SymlinkBase(externalRoot.asFragment(), "<external>"),
-              new SymlinkBase(directories.getWorkspace().asFragment(), "<workspace>"),
-              new SymlinkBase(directories.getOutputBase().asFragment(), "<output_base>"));
-      addDirectory(fp, root, "", bases);
+      marker = marker(repo, success.root().asPath(), externalRoot);
     } catch (IOException e) {
       throw new RepoContentDigestFunctionException(e);
     }
-    byte[] digest = fp.digestAndReset();
-    if (fetchIdentity != null) {
-      persistDigest(digestFile, fetchIdentity, digest);
+    if (marker == null) {
+      return Value.USE_FILE_DIGESTS;
     }
-    return new Value(digest);
+    return new Value(new Fingerprint().addString("<marker>").addString(marker).digestAndReset());
   }
 
   /**
-   * Returns the contents of the marker file of {@code repo} if its contents came from a
-   * reproducible fetch, or null otherwise.
+   * Returns whether {@code definition} is a {@code local_repository} or {@code
+   * new_local_repository} whose path is in the workspace, so that its files are checked in.
    */
-  @Nullable
-  private String reproducibleMarker(RepositoryName repo, Path root, Path externalRoot) {
-    try {
-      if (root.getFileSystem() instanceof InMemoryRepoMarkerFiles inMemory) {
-        String marker = inMemory.getInMemoryMarkerFileContents(repo.getName());
-        if (marker != null) {
-          // Served from the remote repo contents cache, which only holds reproducible repos.
-          return marker;
-        }
-      }
-      FileStatus status = root.statIfFound(Symlinks.NOFOLLOW);
-      if (status == null) {
-        return null;
-      }
-      if (status.isSymbolicLink()) {
-        // Served from the local repo contents cache, which only holds reproducible repos. An entry
-        // is never modified, and Bazel moves the repo's marker file next to it.
-        Path entry = root.resolveSymbolicLinks();
-        Path recordedInputs =
-            entry
-                .getParentDirectory()
-                .getChild(entry.getBaseName() + LocalRepoContentsCache.RECORDED_INPUTS_SUFFIX);
-        return recordedInputs.isFile() ? readLatin1(recordedInputs) : null;
-      }
-      Path marker = externalRoot.getChild(repo.getMarkerFileName());
-      if (!DigestWriter.getReproduciblePath(directories, repo).exists() || !marker.isFile()) {
-        return null;
-      }
-      return readLatin1(marker);
-    } catch (IOException e) {
-      return null;
+  private boolean isInWorkspace(RepoDefinition definition) {
+    RepoRuleId id = definition.repoRule().id();
+    if (!id.equals(LocalPathRepoSpecs.LOCAL_REPOSITORY) && !id.equals(NEW_LOCAL_REPOSITORY)) {
+      return false;
     }
+    if (!(definition.attrValues().attributes().get("path") instanceof String path)) {
+      return false;
+    }
+    // Resolved the way local.bzl resolves it: a relative path is relative to the workspace.
+    Path workspace = directories.getWorkspace();
+    Path dir = workspace.getRelative(path);
+    return dir.startsWith(workspace) && !dir.startsWith(directories.getOutputBase());
   }
 
-  /**
-   * Returns a string that differs between any two fetches of {@code repo} into the external
-   * directory that can produce different files, or null if there is none and the repo's digest must
-   * not be persisted.
-   *
-   * <p>It includes the repo's marker file, which records the inputs of its repo rule (definition,
-   * and the contents of the files and directories it read, such as the patches and overlay files of
-   * a local registry module).
-   */
+  /** Returns the contents of the marker file of {@code repo}, or null if it has none. */
   @Nullable
-  private static String fetchIdentity(RepositoryName repo, Path root, Path externalRoot) {
-    try {
-      FileStatus status = root.statIfFound(Symlinks.NOFOLLOW);
-      if (status == null || status.isSymbolicLink()) {
-        return null;
+  private static String marker(RepositoryName repo, Path root, Path externalRoot)
+      throws IOException {
+    if (root.getFileSystem() instanceof InMemoryRepoMarkerFiles inMemory) {
+      String marker = inMemory.getInMemoryMarkerFileContents(repo.getName());
+      if (marker != null) {
+        // Served from the remote repo contents cache.
+        return marker;
       }
-      Path marker = externalRoot.getChild(repo.getMarkerFileName());
-      if (!marker.isFile()) {
-        return null;
-      }
-      // Bazel recreates the repo directory on every refetch, even when the marker comes out the
-      // same, for example when a repo rule downloads a file it does not pin.
-      return identity(
-          "fetched",
-          readLatin1(marker),
-          Long.toString(status.getNodeId()),
-          Long.toString(status.getLastChangeTime()));
-    } catch (IOException e) {
+    }
+    FileStatus status = root.statIfFound(Symlinks.NOFOLLOW);
+    if (status == null) {
       return null;
     }
-  }
-
-  private static String identity(String... parts) {
-    Fingerprint fp = new Fingerprint();
-    fp.addString(DIGEST_FILE_FORMAT);
-    for (String part : parts) {
-      fp.addString(part);
+    if (status.isSymbolicLink()) {
+      // An entry of the local repo contents cache, whose marker Bazel moves next to it, or a repo
+      // rule that symlinked the repo directory itself, whose marker is in the external directory.
+      Path entry = root.resolveSymbolicLinks();
+      Path recordedInputs =
+          entry
+              .getParentDirectory()
+              .getChild(entry.getBaseName() + LocalRepoContentsCache.RECORDED_INPUTS_SUFFIX);
+      if (recordedInputs.isFile()) {
+        return readLatin1(recordedInputs);
+      }
     }
-    return fp.hexDigestAndReset();
+    Path marker = externalRoot.getChild(repo.getMarkerFileName());
+    return marker.isFile() ? readLatin1(marker) : null;
   }
 
   private static String readLatin1(Path path) throws IOException {
     return new String(FileSystemUtils.readContentAsLatin1(path));
-  }
-
-  /** Returns the digest persisted for {@code fetchIdentity}, or null if there is none. */
-  @Nullable
-  private static byte[] readPersistedDigest(Path digestFile, String fetchIdentity) {
-    try {
-      String[] fields = readLatin1(digestFile).strip().split(" ");
-      if (fields.length != 2 || !fields[0].equals(fetchIdentity) || fields[1].isEmpty()) {
-        return null;
-      }
-      return BaseEncoding.base16().lowerCase().decode(fields[1]);
-    } catch (IOException | IllegalArgumentException e) {
-      return null;
-    }
-  }
-
-  private static void persistDigest(Path digestFile, String fetchIdentity, byte[] digest) {
-    Path tmp = digestFile.getParentDirectory().getChild(digestFile.getBaseName() + ".tmp");
-    try {
-      FileSystemUtils.writeContentAsLatin1(
-          tmp, fetchIdentity + " " + BaseEncoding.base16().lowerCase().encode(digest) + "\n");
-      tmp.renameTo(digestFile);
-    } catch (IOException e) {
-      // Persisting is only an optimization: without it, the next server computes the digest again.
-    }
-  }
-
-  /** A directory that absolute symlink targets under it are hashed relative to. */
-  private record SymlinkBase(PathFragment path, String name) {}
-
-  /** Adds the sorted entries of {@code dir}, recursively, without following symlinks. */
-  private void addDirectory(
-      Fingerprint fp, Path dir, String relativePath, ImmutableList<SymlinkBase> bases)
-      throws IOException, InterruptedException {
-    List<Dirent> entries = new ArrayList<>(dir.readdir(Symlinks.NOFOLLOW));
-    entries.sort(Comparator.comparing(Dirent::getName));
-    for (Dirent entry : entries) {
-      if (Thread.interrupted()) {
-        throw new InterruptedException();
-      }
-      Path path = dir.getChild(entry.getName());
-      String childPath = relativePath + "/" + entry.getName();
-      fp.addString(childPath);
-      switch (entry.getType()) {
-        case DIRECTORY -> {
-          fp.addString("<directory>");
-          addDirectory(fp, path, childPath, bases);
-        }
-        case SYMLINK -> {
-          fp.addString("<symlink>");
-          addSymlinkTarget(fp, path, bases);
-        }
-        case FILE -> {
-          fp.addString("<file>");
-          fp.addBytes(path.getDigest());
-        }
-        default -> fp.addString("<special>");
-      }
-    }
-  }
-
-  private void addSymlinkTarget(Fingerprint fp, Path link, ImmutableList<SymlinkBase> bases)
-      throws IOException {
-    PathFragment target = link.readSymbolicLink();
-    if (!target.isAbsolute()) {
-      fp.addString(target.getPathString());
-      return;
-    }
-    for (SymlinkBase base : bases) {
-      if (target.startsWith(base.path())) {
-        fp.addString(base.name());
-        fp.addString(target.relativeTo(base.path()).getPathString());
-        if (base.name().equals("<workspace>")) {
-          Path file = link.getFileSystem().getPath(target);
-          FileStatus status = file.statIfFound(Symlinks.FOLLOW);
-          if (status != null && status.isFile()) {
-            fp.addBytes(file.getDigest());
-          } else {
-            fp.addString(status == null ? "<missing>" : "<not a file>");
-          }
-        }
-        return;
-      }
-    }
-    fp.addString(target.getPathString());
   }
 
   private static final class RepoContentDigestFunctionException extends SkyFunctionException {

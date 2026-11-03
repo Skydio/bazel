@@ -288,7 +288,6 @@ public final class RepositoryFetchFunction implements SkyFunction {
             return null;
           }
           if (cacheHit) {
-            digestWriter.markReproducible();
             return new Success(Root.fromPath(repoRoot), excludeRepoFromVendoring);
           }
         } catch (IOException e) {
@@ -316,7 +315,6 @@ public final class RepositoryFetchFunction implements SkyFunction {
       }
       digestWriter.writeMarkerFile(result.recordedInputValues());
       if (result.reproducible() == Reproducibility.YES && !repoDefinition.repoRule().local()) {
-        digestWriter.markReproducible();
         // This repo may be eligible for the local and remote repo contents cache.
         // Replant symlinks before caching to convert absolute symlinks relative if possible, which
         // can make more repos eligible.
