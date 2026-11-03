@@ -414,6 +414,63 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
   }
 
   @Test
+  public void dependencyInARepoThatFailsToFetch_isReported() throws Exception {
+    reporter.removeHandler(failFastHandler);
+    scratch.file(
+        "defs/failing.bzl",
+        """
+        def _impl(rctx):
+            fail("download failed")
+
+        failing_repo = repository_rule(implementation = _impl)
+        """);
+    rewriteModuleDotBazel(
+        "register_toolchains('//tc:all')",
+        "failing_repo = use_repo_rule('//defs:failing.bzl', 'failing_repo')",
+        "failing_repo(name = 'failing')");
+    scratch.file(
+        "failing_user/BUILD",
+        """
+        filegroup(
+            name = "uses_failing",
+            srcs = ["@failing//:files"],
+        )
+        """);
+    Label user = Label.parseCanonical("//failing_user:uses_failing");
+
+    TransitiveHashes.Result result = compute(user);
+
+    // A failed fetch must not be hashed like a dependency that does not exist: whether it fails
+    // depends on the machine.
+    assertThat(result.errors()).isNotEmpty();
+  }
+
+  @Test
+  public void registeredToolchainThatFailsToLoad_isReported() throws Exception {
+    reporter.removeHandler(failFastHandler);
+    scratch.file(
+        "broken_tc/BUILD",
+        """
+        load("//defs:defs.bzl", "my_toolchain")
+
+        my_toolchain(name = "impl", src = "x.txt")
+
+        toolchain(
+            name = "tc",
+            toolchain = ":impl",
+            toolchain_type = "//tc:type",
+        )
+
+        fail("broken package")
+        """);
+    writeModuleFile(/* content= */ "a", /* unused= */ "1", /* toolchains= */ "//broken_tc:tc");
+
+    TransitiveHashes.Result result = compute(Label.parseCanonical("//app:lib"));
+
+    assertThat(result.errors().keySet()).contains(Label.parseCanonical("//tc:type"));
+  }
+
+  @Test
   public void unavailableRegisteredToolchains_areReported() throws Exception {
     writeModuleFile(/* content= */ "a", /* unused= */ "1", /* toolchains= */ "//nonexistent:all");
 

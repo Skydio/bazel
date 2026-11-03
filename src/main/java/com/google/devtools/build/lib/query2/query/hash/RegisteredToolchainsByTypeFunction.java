@@ -18,7 +18,6 @@ import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ImmutableSetMultimap;
-import com.google.common.collect.ImmutableSortedSet;
 import com.google.common.collect.Ordering;
 import com.google.devtools.build.lib.bazel.bzlmod.BazelDepGraphValue;
 import com.google.devtools.build.lib.bazel.bzlmod.Module;
@@ -58,6 +57,9 @@ import javax.annotation.Nullable;
  * TransitiveHashes} uses this to make every {@code toolchain_type} depend on all toolchains
  * registered for it, so that a change to any of them reaches the targets that may use it.
  *
+ * <p>A registered toolchain that cannot be loaded is an error: its type is unknown, so it could
+ * implement any type and no hash would account for it.
+ *
  * <p>Toolchains added with {@code --extra_toolchains} are not included: they are part of the
  * configuration.
  */
@@ -78,40 +80,24 @@ public final class RegisteredToolchainsByTypeFunction implements SkyFunction {
   /** The registered toolchains, grouped by toolchain type. */
   public static final class Value implements SkyValue {
     private final ImmutableSetMultimap<Label, Label> toolchainsByType;
-    private final ImmutableSortedSet<Label> toolchainsOfUnknownType;
 
-    Value(
-        ImmutableSetMultimap<Label, Label> toolchainsByType,
-        ImmutableSortedSet<Label> toolchainsOfUnknownType) {
+    Value(ImmutableSetMultimap<Label, Label> toolchainsByType) {
       this.toolchainsByType = toolchainsByType;
-      this.toolchainsOfUnknownType = toolchainsOfUnknownType;
     }
 
-    /**
-     * Returns the toolchains that may implement {@code toolchainType}: those registered for it,
-     * plus those whose type could not be determined because they failed to load.
-     */
+    /** Returns the toolchains registered for {@code toolchainType}. */
     public ImmutableSet<Label> getToolchains(Label toolchainType) {
-      ImmutableSet<Label> toolchains = toolchainsByType.get(toolchainType);
-      if (toolchainsOfUnknownType.isEmpty()) {
-        return toolchains;
-      }
-      return ImmutableSet.<Label>builder()
-          .addAll(toolchains)
-          .addAll(toolchainsOfUnknownType)
-          .build();
+      return toolchainsByType.get(toolchainType);
     }
 
     @Override
     public boolean equals(Object o) {
-      return o instanceof Value other
-          && toolchainsByType.equals(other.toolchainsByType)
-          && toolchainsOfUnknownType.equals(other.toolchainsOfUnknownType);
+      return o instanceof Value other && toolchainsByType.equals(other.toolchainsByType);
     }
 
     @Override
     public int hashCode() {
-      return 31 * toolchainsByType.hashCode() + toolchainsOfUnknownType.hashCode();
+      return toolchainsByType.hashCode();
     }
   }
 
@@ -148,7 +134,6 @@ public final class RegisteredToolchainsByTypeFunction implements SkyFunction {
         ImmutableSetMultimap.<Label, Label>builder()
             .orderKeysBy(Ordering.natural())
             .orderValuesBy(Ordering.natural());
-    ImmutableSortedSet.Builder<Label> toolchainsOfUnknownType = ImmutableSortedSet.naturalOrder();
     for (Label toolchain : toolchainLabels) {
       Label toolchainType = null;
       try {
@@ -159,21 +144,26 @@ public final class RegisteredToolchainsByTypeFunction implements SkyFunction {
           return null;
         }
         Package pkg = packageValue.getPackage();
+        if (pkg.containsErrors()) {
+          throw new RegisteredToolchainsByTypeFunctionException(
+              new NoSuchPackageException(
+                  toolchain.getPackageIdentifier(),
+                  "the package of a registered toolchain has errors"));
+        }
         Target target = pkg.getTarget(toolchain.getName());
         if (target instanceof Rule rule) {
           toolchainType =
               NonconfigurableAttributeMapper.of(rule).get("toolchain_type", BuildType.LABEL);
         }
       } catch (NoSuchPackageException | NoSuchTargetException e) {
-        // Fall through: a toolchain that can't be read conservatively counts for every type.
+        // A toolchain whose type is unknown could implement any type, so no hash can be trusted.
+        throw new RegisteredToolchainsByTypeFunctionException(e);
       }
       if (toolchainType != null) {
         toolchainsByType.put(toolchainType, toolchain);
-      } else {
-        toolchainsOfUnknownType.add(toolchain);
       }
     }
-    return new Value(toolchainsByType.build(), toolchainsOfUnknownType.build());
+    return new Value(toolchainsByType.build());
   }
 
   /**
