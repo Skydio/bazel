@@ -68,7 +68,14 @@ public final class TransitiveHashes {
    *     dependencies whose hashes may be wrong. A dependency that does not exist is not an error:
    *     it is hashed as missing, so creating it changes the hashes of its dependents.
    */
-  public record Result(ImmutableMap<Label, String> hashes, ImmutableMap<Label, ErrorInfo> errors) {}
+  /**
+   * The hashes of the roots, the errors, and the direct hash (the target's own inputs, without its
+   * dependencies) of every target visited, for comparing two machines' hashes.
+   */
+  public record Result(
+      ImmutableMap<Label, String> hashes,
+      ImmutableMap<Label, ErrorInfo> errors,
+      ImmutableMap<Label, String> directHashes) {}
 
   /** Evaluates Skyframe keys with keep-going semantics. */
   @FunctionalInterface
@@ -142,7 +149,12 @@ public final class TransitiveHashes {
         rootHashes.put(root, BaseEncoding.base16().lowerCase().encode(hash));
       }
     }
-    return new Result(rootHashes.buildOrThrow(), ImmutableMap.copyOf(errors));
+    ImmutableMap.Builder<Label, String> directHashes = ImmutableMap.builder();
+    graph.forEach(
+        (label, value) ->
+            directHashes.put(label, BaseEncoding.base16().lowerCase().encode(value.getDirectHash())));
+    return new Result(
+        rootHashes.buildOrThrow(), ImmutableMap.copyOf(errors), directHashes.buildOrThrow());
   }
 
   private static boolean isRepositoryFetchFailure(Throwable e) {

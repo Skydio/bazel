@@ -35,6 +35,7 @@ import com.google.devtools.build.lib.query2.engine.QuerySyntaxException;
 import com.google.devtools.build.lib.query2.engine.QueryUtil;
 import com.google.devtools.build.lib.query2.engine.QueryUtil.AggregateAllOutputFormatterCallback;
 import com.google.devtools.build.lib.query2.engine.ThreadSafeOutputFormatterCallback;
+import com.google.devtools.build.lib.query2.query.hash.RepoContentDigestFunction;
 import com.google.devtools.build.lib.query2.query.hash.TransitiveHashes;
 import com.google.devtools.build.lib.query2.query.output.OutputFormatter;
 import com.google.devtools.build.lib.query2.query.output.QueryOptions;
@@ -55,6 +56,8 @@ import com.google.devtools.build.lib.util.Either;
 import com.google.devtools.build.lib.util.ExitCode;
 import com.google.devtools.build.lib.util.InterruptedFailureDetails;
 import com.google.devtools.build.skyframe.EvaluationContext;
+import com.google.devtools.build.lib.vfs.FileSystemUtils;
+import com.google.devtools.build.lib.vfs.Path;
 import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
@@ -242,6 +245,28 @@ public final class QueryCommand extends QueryEnvironmentBasedCommand {
    * target. Returns a failure result if a hash could not be computed or may be wrong, or null.
    */
   @Nullable
+  /**
+   * Writes every visited target's direct hash to {@code <output_base>/hash_markers/_direct_hashes},
+   * sorted, so that the targets where two machines' hashes start to differ can be found.
+   * Best-effort: a failure to write is ignored.
+   */
+  private static void writeDirectHashes(
+      CommandEnvironment env, TransitiveHashes.Result result, LabelPrinter labelPrinter) {
+    StringBuilder out = new StringBuilder();
+    result.directHashes().entrySet().stream()
+        .map(e -> labelPrinter.toString(e.getKey()) + " " + e.getValue() + "\n")
+        .sorted()
+        .forEach(out::append);
+    Path dir =
+        env.getOutputBase().getRelative(RepoContentDigestFunction.HASH_MARKERS_DIR);
+    try {
+      dir.createDirectoryAndParents();
+      FileSystemUtils.writeContentAsLatin1(dir.getChild("_direct_hashes"), out.toString());
+    } catch (IOException e) {
+      // Only a debugging aid.
+    }
+  }
+
   private static BlazeCommandResult outputHashes(
       CommandEnvironment env,
       QueryOptions queryOptions,
@@ -261,6 +286,7 @@ public final class QueryCommand extends QueryEnvironmentBasedCommand {
             labels,
             keys -> env.getSkyframeExecutor().prepareAndGet(keys, evaluationContext),
             message -> env.getReporter().handle(Event.progress(message)));
+    writeDirectHashes(env, result, labelPrinter);
     String lineTerminator = queryOptions.getLineTerminator();
     for (Label label : labels) {
       String hash = result.hashes().get(label);
