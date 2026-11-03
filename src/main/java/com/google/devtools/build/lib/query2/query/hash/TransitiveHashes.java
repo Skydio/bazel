@@ -152,7 +152,8 @@ public final class TransitiveHashes {
     ImmutableMap.Builder<Label, String> directHashes = ImmutableMap.builder();
     graph.forEach(
         (label, value) ->
-            directHashes.put(label, BaseEncoding.base16().lowerCase().encode(value.getDirectHash())));
+            directHashes.put(
+                label, BaseEncoding.base16().lowerCase().encode(value.getDirectHash())));
     return new Result(
         rootHashes.buildOrThrow(), ImmutableMap.copyOf(errors), directHashes.buildOrThrow());
   }
