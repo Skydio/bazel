@@ -24,6 +24,7 @@ import com.google.devtools.build.lib.analysis.util.AnalysisMock;
 import com.google.devtools.build.lib.analysis.util.BuildViewTestCase;
 import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.rules.repository.RepositoryDirectoryValue;
+import com.google.devtools.build.lib.vfs.FileSystemUtils;
 import com.google.devtools.build.skyframe.EvaluationContext;
 import com.google.devtools.build.skyframe.SkyFunction;
 import com.google.devtools.build.skyframe.SkyFunctionName;
@@ -47,7 +48,9 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
             .put(DirectTargetHashFunction.NAME, new DirectTargetHashFunction(directories))
             .put(SourceFileDigestFunction.NAME, new SourceFileDigestFunction())
             .put(RepoContentDigestFunction.NAME, new RepoContentDigestFunction(directories))
-            .put(RegisteredToolchainsByTypeFunction.NAME, new RegisteredToolchainsByTypeFunction())
+            .put(
+                RegisteredToolchainsByTypeFunction.NAME,
+                new RegisteredToolchainsByTypeFunction(directories))
             .buildOrThrow();
       }
     };
@@ -414,6 +417,63 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
   }
 
   @Test
+  public void dependencyInARepoThatFailsToFetch_isReported() throws Exception {
+    reporter.removeHandler(failFastHandler);
+    scratch.file(
+        "defs/failing.bzl",
+        """
+        def _impl(rctx):
+            fail("download failed")
+
+        failing_repo = repository_rule(implementation = _impl)
+        """);
+    rewriteModuleDotBazel(
+        "register_toolchains('//tc:all')",
+        "failing_repo = use_repo_rule('//defs:failing.bzl', 'failing_repo')",
+        "failing_repo(name = 'failing')");
+    scratch.file(
+        "failing_user/BUILD",
+        """
+        filegroup(
+            name = "uses_failing",
+            srcs = ["@failing//:files"],
+        )
+        """);
+    Label user = Label.parseCanonical("//failing_user:uses_failing");
+
+    TransitiveHashes.Result result = compute(user);
+
+    // A failed fetch must not be hashed like a dependency that does not exist: whether it fails
+    // depends on the machine.
+    assertThat(result.errors()).isNotEmpty();
+  }
+
+  @Test
+  public void registeredToolchainThatFailsToLoad_isReported() throws Exception {
+    reporter.removeHandler(failFastHandler);
+    scratch.file(
+        "broken_tc/BUILD",
+        """
+        load("//defs:defs.bzl", "my_toolchain")
+
+        my_toolchain(name = "impl", src = "x.txt")
+
+        toolchain(
+            name = "tc",
+            toolchain = ":impl",
+            toolchain_type = "//tc:type",
+        )
+
+        fail("broken package")
+        """);
+    writeModuleFile(/* content= */ "a", /* unused= */ "1", /* toolchains= */ "//broken_tc:tc");
+
+    TransitiveHashes.Result result = compute(Label.parseCanonical("//app:lib"));
+
+    assertThat(result.errors().keySet()).contains(Label.parseCanonical("//tc:type"));
+  }
+
+  @Test
   public void unavailableRegisteredToolchains_areReported() throws Exception {
     writeModuleFile(/* content= */ "a", /* unused= */ "1", /* toolchains= */ "//nonexistent:all");
 
@@ -455,6 +515,23 @@ public final class TransitiveHashesIntegrationTest extends BuildViewTestCase {
     var result = getSkyframeExecutor().prepareAndGet(ImmutableSet.of(key), context);
     assertThat(result.getError(key)).isNull();
     return ImmutableList.copyOf(((DirectTargetHashFunction.Value) result.get(key)).getDeps());
+  }
+
+  @Test
+  public void externalRepoHash_isRecordedUnderTheOutputBase() throws Exception {
+    var unused = extHashes();
+
+    var records =
+        directories
+            .getOutputBase()
+            .getRelative(RepoContentDigestFunction.HASH_MARKERS_DIR)
+            .getDirectoryEntries();
+    var ext = records.stream().filter(p -> p.getBaseName().endsWith("+ext")).findFirst();
+    assertThat(ext).isPresent();
+    assertThat(
+            new String(
+                FileSystemUtils.readContentAsLatin1(ext.get())))
+        .startsWith("marker fetched\n");
   }
 
   @Test

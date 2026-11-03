@@ -21,6 +21,7 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.io.BaseEncoding;
 import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.packages.NoSuchThingException;
+import com.google.devtools.build.lib.packages.RepositoryFetchException;
 import com.google.devtools.build.lib.util.Fingerprint;
 import com.google.devtools.build.skyframe.ErrorInfo;
 import com.google.devtools.build.skyframe.EvaluationResult;
@@ -67,7 +68,14 @@ public final class TransitiveHashes {
    *     dependencies whose hashes may be wrong. A dependency that does not exist is not an error:
    *     it is hashed as missing, so creating it changes the hashes of its dependents.
    */
-  public record Result(ImmutableMap<Label, String> hashes, ImmutableMap<Label, ErrorInfo> errors) {}
+  /**
+   * The hashes of the roots, the errors, and the direct hash (the target's own inputs, without its
+   * dependencies) of every target visited, for comparing two machines' hashes.
+   */
+  public record Result(
+      ImmutableMap<Label, String> hashes,
+      ImmutableMap<Label, ErrorInfo> errors,
+      ImmutableMap<Label, String> directHashes) {}
 
   /** Evaluates Skyframe keys with keep-going semantics. */
   @FunctionalInterface
@@ -103,11 +111,14 @@ public final class TransitiveHashes {
         SkyKey key = DirectTargetHashFunction.key(label);
         DirectTargetHashFunction.Value value = (DirectTargetHashFunction.Value) result.get(key);
         if (value == null) {
-          // Deps that do not exist are hashed as missing leaves; see hashOf.
+          // Deps that do not exist are hashed as missing leaves; see hashOf. A dep in a repo that
+          // failed to fetch does exist, and hashing it as missing would depend on whether this
+          // machine's fetch happened to fail.
           ErrorInfo error = result.getError(key);
           if (error != null
               && (rootSet.contains(label)
-                  || !(error.getException() instanceof NoSuchThingException))) {
+                  || !(error.getException() instanceof NoSuchThingException)
+                  || isRepositoryFetchFailure(error.getException()))) {
             errors.put(label, error);
           }
           continue;
@@ -138,7 +149,22 @@ public final class TransitiveHashes {
         rootHashes.put(root, BaseEncoding.base16().lowerCase().encode(hash));
       }
     }
-    return new Result(rootHashes.buildOrThrow(), ImmutableMap.copyOf(errors));
+    ImmutableMap.Builder<Label, String> directHashes = ImmutableMap.builder();
+    graph.forEach(
+        (label, value) ->
+            directHashes.put(
+                label, BaseEncoding.base16().lowerCase().encode(value.getDirectHash())));
+    return new Result(
+        rootHashes.buildOrThrow(), ImmutableMap.copyOf(errors), directHashes.buildOrThrow());
+  }
+
+  private static boolean isRepositoryFetchFailure(Throwable e) {
+    for (Throwable t = e; t != null; t = t.getCause()) {
+      if (t instanceof RepositoryFetchException) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** Lazily evaluates {@link RegisteredToolchainsByTypeFunction}, once per computation. */
