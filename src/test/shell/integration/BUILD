@@ -1027,3 +1027,13 @@ test_suite(
     name = "all_tests",
     visibility = ["//visibility:public"],
 )
+
+sh_test(
+    name = "build_query_test",
+    size = "medium",
+    srcs = ["build_query_test.sh"],
+    data = [
+        ":test-deps",
+        "@bazel_tools//tools/bash/runfiles",
+    ],
+)
