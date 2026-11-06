@@ -201,6 +201,21 @@ FAILED: Build did NOT complete successfully
 Incompatible explicit targets are silently skipped if
 `--skip_incompatible_explicit_targets` is enabled.
 
+To make sure that particular targets are never silently skipped, tag them and
+pass the tag to `--error_on_incompatible_targets_with_tags`. An incompatible
+top-level target with one of the listed tags is an error however it was
+requested, including through a wildcard such as `//...` or a `test_suite`, and
+even with `--skip_incompatible_explicit_targets`. Other incompatible targets are
+skipped as usual.
+
+```console
+$ bazel build --platforms=//:myplatform --error_on_incompatible_targets_with_tags=release //...
+...
+ERROR: Target //:release_artifact is incompatible and cannot be built, but has a tag listed in --error_on_incompatible_targets_with_tags.
+...
+FAILED: Build did NOT complete successfully
+```
+
 ### More expressive constraints {:#expressive-constraints}
 
 For more flexibility in expressing constraints, use the
