@@ -26,6 +26,7 @@ import static org.mockito.Mockito.when;
 
 import com.google.common.collect.ImmutableList;
 import com.google.devtools.build.lib.actions.Action;
+import com.google.devtools.build.lib.actions.ActionAnalysisMetadata;
 import com.google.devtools.build.lib.actions.ActionLookupData;
 import com.google.devtools.build.lib.actions.ActionLookupKey;
 import com.google.devtools.build.lib.actions.ActionLookupValue;
@@ -198,6 +199,7 @@ public final class RemoteRewoundActionSynchronizerTest {
             ImmutableList.of(),
             ImmutableList.of());
     when(metadataProvider.getRunfilesMetadata(runfiles)).thenReturn(runfilesValue);
+    mockActions(owner, ImmutableList.of(producer, unrelatedProducer, runfilesAction));
 
     // Switch to the fine locks with an unrelated rewound action first: the coarse lock would
     // exclude every rewound action regardless of which keys guard the runfiles tree.
@@ -217,6 +219,62 @@ public final class RemoteRewoundActionSynchronizerTest {
       runfilesPreparation.joinAndAssertState(DEADLOCK_TIMEOUT_MILLIS);
     }
     preparation.joinAndAssertState(DEADLOCK_TIMEOUT_MILLIS);
+  }
+
+  /**
+   * The output of a symlink action may be materialized as a symlink to its target, so the producer
+   * of the target must not be rewound while a consumer of the output runs, even across a chain of
+   * symlink actions.
+   */
+  @Test
+  public void symlinkTargetProducerRewound_waitsForSymlinkConsumer_coarseLock() throws Exception {
+    symlinkTargetProducerRewound_waitsForSymlinkConsumer(/* inflateFineLocksFirst= */ false);
+  }
+
+  @Test
+  public void symlinkTargetProducerRewound_waitsForSymlinkConsumer_fineLocks() throws Exception {
+    symlinkTargetProducerRewound_waitsForSymlinkConsumer(/* inflateFineLocksFirst= */ true);
+  }
+
+  private void symlinkTargetProducerRewound_waitsForSymlinkConsumer(boolean inflateFineLocksFirst)
+      throws Exception {
+    FileSystem fs = new InMemoryFileSystem(DigestHashFunction.SHA256);
+    ArtifactRoot root = ArtifactRoot.asDerivedRoot(fs.getPath("/exec"), RootType.OUTPUT, "out");
+    var owner = ActionsTestUtil.NULL_ARTIFACT_OWNER;
+    DerivedArtifact target = (DerivedArtifact) ActionsTestUtil.createArtifact(root, "target");
+    target.setGeneratingActionKey(ActionLookupData.create(owner, 0));
+    Action targetProducer = newAction(ImmutableList.of(target), ImmutableList.of());
+    DerivedArtifact symlink = (DerivedArtifact) ActionsTestUtil.createArtifact(root, "symlink");
+    symlink.setGeneratingActionKey(ActionLookupData.create(owner, 1));
+    Action symlinkAction = newAction(ImmutableList.of(symlink), ImmutableList.of(target));
+    when(symlinkAction.mayInsensitivelyPropagateInputs()).thenReturn(true);
+    DerivedArtifact symlinkToSymlink =
+        (DerivedArtifact) ActionsTestUtil.createArtifact(root, "symlink_to_symlink");
+    symlinkToSymlink.setGeneratingActionKey(ActionLookupData.create(owner, 2));
+    Action symlinkToSymlinkAction =
+        newAction(ImmutableList.of(symlinkToSymlink), ImmutableList.of(symlink));
+    when(symlinkToSymlinkAction.mayInsensitivelyPropagateInputs()).thenReturn(true);
+    DerivedArtifact consumerOutput =
+        (DerivedArtifact) ActionsTestUtil.createArtifact(root, "consumer.out");
+    consumerOutput.setGeneratingActionKey(ActionLookupData.create(owner, 3));
+    Action consumer =
+        newAction(ImmutableList.of(consumerOutput), ImmutableList.of(symlinkToSymlink));
+    mockActions(
+        owner, ImmutableList.of(targetProducer, symlinkAction, symlinkToSymlinkAction, consumer));
+
+    if (inflateFineLocksFirst) {
+      // An unrelated rewound action switches the synchronizer to the fine locks.
+      rewind(newAction());
+    }
+
+    var targetProducerPreparation = new TestThread(() -> rewind(targetProducer));
+    try (SilentCloseable execution =
+        synchronizer.enterActionExecution(
+            consumer, /* wasRewound= */ false, mock(InputMetadataProvider.class))) {
+      targetProducerPreparation.start();
+      waitUntilBlocked(targetProducerPreparation);
+    }
+    targetProducerPreparation.joinAndAssertState(DEADLOCK_TIMEOUT_MILLIS);
   }
 
   /**
@@ -332,7 +390,10 @@ public final class RemoteRewoundActionSynchronizerTest {
             ImmutableList.of(downstreamFile), ImmutableList.of(upstreamFile, treeConsumerOutput));
 
     InputMetadataProvider metadataProvider = mock(InputMetadataProvider.class);
-    mockTemplateExpansion(owner, ImmutableList.of(upstreamAction));
+    mockActions(
+        owner,
+        ImmutableList.of(mock(ActionTemplate.class), treeConsumer, mock(ActionTemplate.class)));
+    mockTemplateExpansion(owner, /* actionIndex= */ 0, ImmutableList.of(upstreamAction));
 
     // C is rewound and prepares for its re-execution, which makes it hold the write lock guarding
     // its output until the end of its execution.
@@ -376,11 +437,24 @@ public final class RemoteRewoundActionSynchronizerTest {
    */
   private void mockTemplateExpansion(ActionLookupKey owner, ImmutableList<Action> expandedActions)
       throws InterruptedException {
-    ActionLookupValue ownerValue = mock(ActionLookupValue.class);
-    when(ownerValue.getActions()).thenReturn(ImmutableList.of(mock(ActionTemplate.class)));
-    when(graph.getValue(owner)).thenReturn(ownerValue);
-    when(graph.getValue(ActionTemplateExpansionValue.key(owner, 0)))
+    mockActions(owner, ImmutableList.of(mock(ActionTemplate.class)));
+    mockTemplateExpansion(owner, /* actionIndex= */ 0, expandedActions);
+  }
+
+  private void mockTemplateExpansion(
+      ActionLookupKey owner, int actionIndex, ImmutableList<Action> expandedActions)
+      throws InterruptedException {
+    when(graph.getValue(ActionTemplateExpansionValue.key(owner, actionIndex)))
         .thenReturn(new ActionTemplateExpansionValue(ImmutableList.copyOf(expandedActions)));
+  }
+
+  /** Makes the graph return an owner whose actions are the given ones, in order. */
+  private void mockActions(
+      ActionLookupKey owner, ImmutableList<? extends ActionAnalysisMetadata> actions)
+      throws InterruptedException {
+    ActionLookupValue ownerValue = mock(ActionLookupValue.class);
+    when(ownerValue.getActions()).thenReturn(ImmutableList.<ActionAnalysisMetadata>copyOf(actions));
+    when(graph.getValue(owner)).thenReturn(ownerValue);
   }
 
   @SuppressWarnings("ThreadPriorityCheck")
