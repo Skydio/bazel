@@ -69,6 +69,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import javax.annotation.Nullable;
 
@@ -186,11 +187,13 @@ public class RemoteActionFileSystem extends FileSystem implements PathCanonicali
    * <p>Safe for concurrent access.
    */
   private class TreeArtifactDirectoryCache {
-    private final Set<SpecialArtifact> cachedTrees = new HashSet<>();
-    private final HashMap<PathFragment, HashSet<Dirent>> dirToEntries = new HashMap<>();
+    private final Set<SpecialArtifact> cachedTrees = ConcurrentHashMap.newKeySet();
+    // The entry sets are not modified once they are in the map.
+    private final ConcurrentHashMap<PathFragment, Set<Dirent>> dirToEntries =
+        new ConcurrentHashMap<>();
 
     @Nullable
-    public synchronized Collection<Dirent> get(PathFragment execPath) {
+    public Collection<Dirent> get(PathFragment execPath) {
       ensureCached(execPath);
       return dirToEntries.get(execPath);
     }
@@ -201,19 +204,36 @@ public class RemoteActionFileSystem extends FileSystem implements PathCanonicali
         return;
       }
       SpecialArtifact parent = Iterables.getFirst(treeMetadata.getChildren(), null).getParent();
-      if (!cachedTrees.contains(parent)) {
-        insertTree(treeMetadata);
-        cachedTrees.add(parent);
+      if (cachedTrees.contains(parent)) {
+        return;
+      }
+      synchronized (this) {
+        if (!cachedTrees.contains(parent)) {
+          insertTree(treeMetadata);
+          cachedTrees.add(parent);
+        }
       }
     }
 
     private void insertTree(TreeArtifactValue treeMetadata) {
+      HashMap<PathFragment, Set<Dirent>> treeDirToEntries = new HashMap<>();
       for (TreeFileArtifact child : treeMetadata.getChildren()) {
-        insertChild(child);
+        insertChild(treeDirToEntries, child);
       }
+      treeDirToEntries.forEach(
+          (dir, entries) ->
+              dirToEntries.merge(
+                  dir,
+                  entries,
+                  (existing, added) -> {
+                    HashSet<Dirent> merged = new HashSet<>(existing);
+                    merged.addAll(added);
+                    return merged;
+                  }));
     }
 
-    private void insertChild(TreeFileArtifact child) {
+    private void insertChild(
+        HashMap<PathFragment, Set<Dirent>> treeDirToEntries, TreeFileArtifact child) {
       PathFragment treeRoot = child.getParent().getExecPath();
       PathFragment path = child.getExecPath();
 
@@ -223,8 +243,8 @@ public class RemoteActionFileSystem extends FileSystem implements PathCanonicali
         Dirent.Type type =
             path.equals(child.getExecPath()) ? Dirent.Type.FILE : Dirent.Type.DIRECTORY;
 
-        HashSet<Dirent> entries =
-            dirToEntries.computeIfAbsent(parentPath, unused -> new HashSet<>());
+        Set<Dirent> entries =
+            treeDirToEntries.computeIfAbsent(parentPath, unused -> new HashSet<>());
 
         if (!entries.add(new Dirent(name, type))) {
           // Avoid wasted work on common prefixes.
