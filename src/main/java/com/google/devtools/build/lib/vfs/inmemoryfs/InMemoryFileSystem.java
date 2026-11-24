@@ -42,6 +42,8 @@ import java.util.Collection;
 import java.util.Deque;
 import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import javax.annotation.Nullable;
 
 /**
@@ -68,6 +70,12 @@ public class InMemoryFileSystem extends FileSystem {
 
   // Maximum number of traversals before ELOOP is thrown.
   private static final int MAX_TRAVERSALS = 256;
+
+  // Guards the directory tree. Lookups hold the read lock, so they run concurrently; anything that
+  // adds, removes or modifies an inode holds the write lock.
+  private final ReentrantReadWriteLock treeLock = new ReentrantReadWriteLock();
+  private final Lock readLock = treeLock.readLock();
+  private final Lock writeLock = treeLock.writeLock();
 
   /**
    * Creates a new {@code InMemoryFileSystem} with default clock and given hash function.
@@ -234,7 +242,17 @@ public class InMemoryFileSystem extends FileSystem {
    *
    * <p>May fail with ENOTDIR, ENOENT, EACCES, ELOOP.
    */
-  private synchronized InodeOrErrno pathWalkErrno(PathFragment path, OnEnoent behavior) {
+  private InodeOrErrno pathWalkErrno(PathFragment path, OnEnoent behavior) {
+    Lock lock = behavior == OnEnoent.HALT ? readLock : writeLock;
+    lock.lock();
+    try {
+      return pathWalkErrnoLocked(path, behavior);
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  private InodeOrErrno pathWalkErrnoLocked(PathFragment path, OnEnoent behavior) {
     Iterator<String> it = path.segments().iterator();
 
     // Prepend the Windows drive if there is one.
@@ -330,12 +348,17 @@ public class InMemoryFileSystem extends FileSystem {
   }
 
   /** Helper method for stat and inodeStat: return the path's (no symlink-followed) stat. */
-  private synchronized InodeOrErrno noFollowStatErrno(PathFragment path) {
-    return switch (getDirectoryErrno(path.getParentDirectory())) {
-      case Errno error -> error;
-      case InMemoryContentInfo dirInfo ->
-          directoryLookupErrno(dirInfo, baseNameOrWindowsDrive(path));
-    };
+  private InodeOrErrno noFollowStatErrno(PathFragment path) {
+    readLock.lock();
+    try {
+      return switch (getDirectoryErrno(path.getParentDirectory())) {
+        case Errno error -> error;
+        case InMemoryContentInfo dirInfo ->
+            directoryLookupErrno(dirInfo, baseNameOrWindowsDrive(path));
+      };
+    } finally {
+      readLock.unlock();
+    }
   }
 
   /**
@@ -421,9 +444,14 @@ public class InMemoryFileSystem extends FileSystem {
   }
 
   @Override
-  public synchronized void setReadable(PathFragment path, boolean readable) throws IOException {
-    InMemoryContentInfo status = inodeStat(path, true);
-    status.setReadable(readable);
+  public void setReadable(PathFragment path, boolean readable) throws IOException {
+    writeLock.lock();
+    try {
+      InMemoryContentInfo status = inodeStat(path, true);
+      status.setReadable(readable);
+    } finally {
+      writeLock.unlock();
+    }
   }
 
   @Override
@@ -433,9 +461,14 @@ public class InMemoryFileSystem extends FileSystem {
   }
 
   @Override
-  public synchronized void setWritable(PathFragment path, boolean writable) throws IOException {
-    InMemoryContentInfo status = inodeStat(path, true);
-    status.setWritable(writable);
+  public void setWritable(PathFragment path, boolean writable) throws IOException {
+    writeLock.lock();
+    try {
+      InMemoryContentInfo status = inodeStat(path, true);
+      status.setWritable(writable);
+    } finally {
+      writeLock.unlock();
+    }
   }
 
   @Override
@@ -445,9 +478,14 @@ public class InMemoryFileSystem extends FileSystem {
   }
 
   @Override
-  public synchronized void setExecutable(PathFragment path, boolean executable) throws IOException {
-    InMemoryContentInfo status = inodeStat(path, true);
-    status.setExecutable(executable);
+  public void setExecutable(PathFragment path, boolean executable) throws IOException {
+    writeLock.lock();
+    try {
+      InMemoryContentInfo status = inodeStat(path, true);
+      status.setExecutable(executable);
+    } finally {
+      writeLock.unlock();
+    }
   }
 
   @Override
@@ -487,7 +525,8 @@ public class InMemoryFileSystem extends FileSystem {
     PathFragment parentDir = path.getParentDirectory();
     String name = baseNameOrWindowsDrive(path);
     Errno error;
-    synchronized (this) {
+    writeLock.lock();
+    try {
       InMemoryDirectoryInfo parent = getDirectory(parentDir);
       InMemoryContentInfo child = parent.getChild(name);
       if (child != null) { // already exists
@@ -498,6 +537,8 @@ public class InMemoryFileSystem extends FileSystem {
       }
       error =
           insertChildDirectory(parent, new InMemoryDirectoryInfo(clock, expectedChildCount), name);
+    } finally {
+      writeLock.unlock();
     }
     if (error != null) {
       throw error.exception(path);
@@ -529,13 +570,16 @@ public class InMemoryFileSystem extends FileSystem {
       throw Errno.EACCES.exception(path);
     }
 
-    synchronized (this) {
+    writeLock.lock();
+    try {
       InMemoryDirectoryInfo parent = getDirectory(path.getParentDirectory());
       if (parent.getChild(baseNameOrWindowsDrive(path)) != null) {
         throw Errno.EEXIST.exception(path);
       }
       insert(
           parent, baseNameOrWindowsDrive(path), new InMemoryLinkInfo(clock, targetFragment), path);
+    } finally {
+      writeLock.unlock();
     }
   }
 
@@ -555,20 +599,25 @@ public class InMemoryFileSystem extends FileSystem {
   }
 
   @Override
-  public synchronized Collection<String> getDirectoryEntries(PathFragment path) throws IOException {
-    InMemoryDirectoryInfo dirInfo = getDirectory(path);
-    if (!dirInfo.isReadable()) {
-      throw Errno.EACCES.exception(path);
-    }
-
-    Collection<String> allChildren = dirInfo.getAllChildren();
-    List<String> result = new ArrayList<>(allChildren.size());
-    for (String child : allChildren) {
-      if (!child.equals(".") && !child.equals("..")) {
-        result.add(child);
+  public Collection<String> getDirectoryEntries(PathFragment path) throws IOException {
+    readLock.lock();
+    try {
+      InMemoryDirectoryInfo dirInfo = getDirectory(path);
+      if (!dirInfo.isReadable()) {
+        throw Errno.EACCES.exception(path);
       }
+
+      Collection<String> allChildren = dirInfo.getAllChildren();
+      List<String> result = new ArrayList<>(allChildren.size());
+      for (String child : allChildren) {
+        if (!child.equals(".") && !child.equals("..")) {
+          result.add(child);
+        }
+      }
+      return result;
+    } finally {
+      readLock.unlock();
     }
-    return result;
   }
 
   @Override
@@ -577,7 +626,8 @@ public class InMemoryFileSystem extends FileSystem {
       throw Errno.EBUSY.exception(path);
     }
 
-    synchronized (this) {
+    writeLock.lock();
+    try {
       switch (getDirectoryErrno(path.getParentDirectory())) {
         case InMemoryDirectoryInfo parent -> {
           InMemoryContentInfo child = parent.getChild(baseNameOrWindowsDrive(path));
@@ -600,6 +650,8 @@ public class InMemoryFileSystem extends FileSystem {
           throw error.exception(path);
         }
       }
+    } finally {
+      writeLock.unlock();
     }
   }
 
@@ -609,27 +661,47 @@ public class InMemoryFileSystem extends FileSystem {
   }
 
   @Override
-  public synchronized void setLastModifiedTime(PathFragment path, long newTime) throws IOException {
-    InMemoryContentInfo status = inodeStat(path, true);
-    status.setLastModifiedTime(
-        newTime == Path.NOW_SENTINEL_TIME ? clock.currentTimeMillis() : newTime);
+  public void setLastModifiedTime(PathFragment path, long newTime) throws IOException {
+    writeLock.lock();
+    try {
+      InMemoryContentInfo status = inodeStat(path, true);
+      status.setLastModifiedTime(
+          newTime == Path.NOW_SENTINEL_TIME ? clock.currentTimeMillis() : newTime);
+    } finally {
+      writeLock.unlock();
+    }
   }
 
   @Override
-  public synchronized InputStream getInputStream(PathFragment path) throws IOException {
-    return statFile(path).getInputStream();
+  public InputStream getInputStream(PathFragment path) throws IOException {
+    readLock.lock();
+    try {
+      return statFile(path).getInputStream();
+    } finally {
+      readLock.unlock();
+    }
   }
 
   @Override
-  public synchronized SeekableByteChannel createReadWriteByteChannel(PathFragment path)
+  public SeekableByteChannel createReadWriteByteChannel(PathFragment path)
       throws IOException {
-    InMemoryContentInfo status = getOrCreateWritableInode(path);
-    return ((FileInfo) status).createReadWriteByteChannel();
+    writeLock.lock();
+    try {
+      InMemoryContentInfo status = getOrCreateWritableInode(path);
+      return ((FileInfo) status).createReadWriteByteChannel();
+    } finally {
+      writeLock.unlock();
+    }
   }
 
   @Override
-  public synchronized byte[] getFastDigest(PathFragment path) throws IOException {
-    return statFile(path).getFastDigest();
+  public byte[] getFastDigest(PathFragment path) throws IOException {
+    readLock.lock();
+    try {
+      return statFile(path).getFastDigest();
+    } finally {
+      readLock.unlock();
+    }
   }
 
   private FileInfo statFile(PathFragment path) throws IOException {
@@ -646,20 +718,25 @@ public class InMemoryFileSystem extends FileSystem {
 
   @Override
   @Nullable
-  public synchronized byte[] getxattr(PathFragment path, String name, boolean followSymlinks)
+  public byte[] getxattr(PathFragment path, String name, boolean followSymlinks)
       throws IOException {
-    InMemoryContentInfo status = inodeStat(path, followSymlinks);
-    if (status.isDirectory()) {
-      throw Errno.EISDIR.exception(path);
+    readLock.lock();
+    try {
+      InMemoryContentInfo status = inodeStat(path, followSymlinks);
+      if (status.isDirectory()) {
+        throw Errno.EISDIR.exception(path);
+      }
+      if (!isReadable(path)) {
+        throw Errno.EACCES.exception(path);
+      }
+      if (!followSymlinks && status.isSymbolicLink()) {
+        return null; // xattr on symlinks not supported.
+      }
+      Preconditions.checkState(status instanceof FileInfo, status);
+      return ((FileInfo) status).getxattr(name);
+    } finally {
+      readLock.unlock();
     }
-    if (!isReadable(path)) {
-      throw Errno.EACCES.exception(path);
-    }
-    if (!followSymlinks && status.isSymbolicLink()) {
-      return null; // xattr on symlinks not supported.
-    }
-    Preconditions.checkState(status instanceof FileInfo, status);
-    return ((FileInfo) status).getxattr(name);
   }
 
   /** Creates a new file at the given path and returns its inode. */
@@ -680,10 +757,15 @@ public class InMemoryFileSystem extends FileSystem {
   }
 
   @Override
-  public synchronized OutputStream getOutputStream(
+  public OutputStream getOutputStream(
       PathFragment path, boolean append, boolean internal) throws IOException {
-    InMemoryContentInfo status = getOrCreateWritableInode(path);
-    return ((FileInfo) status).getOutputStream(append);
+    writeLock.lock();
+    try {
+      InMemoryContentInfo status = getOrCreateWritableInode(path);
+      return ((FileInfo) status).getOutputStream(append);
+    } finally {
+      writeLock.unlock();
+    }
   }
 
   @Override
@@ -694,7 +776,8 @@ public class InMemoryFileSystem extends FileSystem {
     if (isRootDirectory(targetPath)) {
       throw Errno.EACCES.exception(targetPath);
     }
-    synchronized (this) {
+    writeLock.lock();
+    try {
       InMemoryDirectoryInfo sourceParent = getDirectory(sourcePath.getParentDirectory());
       InMemoryDirectoryInfo targetParent = getDirectory(targetPath.getParentDirectory());
 
@@ -731,6 +814,8 @@ public class InMemoryFileSystem extends FileSystem {
             sourcePath); // restore source
         throw e;
       }
+    } finally {
+      writeLock.unlock();
     }
   }
 
@@ -743,7 +828,8 @@ public class InMemoryFileSystem extends FileSystem {
       throw Errno.EACCES.exception(originalPath);
     }
 
-    synchronized (this) {
+    writeLock.lock();
+    try {
       InMemoryDirectoryInfo linkParent = getDirectory(linkPath.getParentDirectory());
       // Same check used when creating a symbolic link
       if (linkParent.getChild(baseNameOrWindowsDrive(linkPath)) != null) {
@@ -755,6 +841,8 @@ public class InMemoryFileSystem extends FileSystem {
           getDirectory(originalPath.getParentDirectory())
               .getChild(baseNameOrWindowsDrive(originalPath)),
           linkPath);
+    } finally {
+      writeLock.unlock();
     }
   }
 
